@@ -18,7 +18,8 @@ import streamlit as st
 
 from qc_screener.analyzer import DealInputs, analyze, sensitivity
 from qc_screener.cities import normalize_city
-from qc_screener.config import LepineCriteria
+from qc_screener.config import LepineCriteria, LocationFilter
+from qc_screener.geo import haversine_km
 from qc_screener.lepine import compute_metrics, screen
 from qc_screener.market import estimate_market_revenue
 from qc_screener.models import Listing
@@ -58,6 +59,7 @@ def load_listings() -> pd.DataFrame:
     rows = conn.execute("SELECT source, payload FROM listings").fetchall()
     records = []
     crit = LepineCriteria()
+    loc = LocationFilter()
     for source, payload in rows:
         try:
             L = Listing.model_validate_json(payload)
@@ -86,6 +88,10 @@ def load_listings() -> pd.DataFrame:
             "fetched_at": L.fetched_at,
             "lat": L.lat,
             "lon": L.lon,
+            "distance_km": (
+                round(haversine_km(loc.home_lat, loc.home_lon, L.lat, L.lon), 1)
+                if (L.lat is not None and L.lon is not None) else None
+            ),
             "per_unit_rents": L.per_unit_rents,
             "renovations_done": L.renovations_done,
             "renovations_needed": L.renovations_needed,
@@ -149,6 +155,22 @@ with st.sidebar:
         st.metric("Comparables loyer", f"{len(rdf):,}")
 
     st.divider()
+    st.subheader("📍 Filtre géographique")
+    loc_default = LocationFilter()
+    max_km = st.slider(
+        "Distance max de la maison (km, vol d'oiseau)",
+        min_value=10, max_value=800,
+        value=int(loc_default.max_km), step=10,
+        help=f"Centre: {loc_default.home_lat:.3f}, {loc_default.home_lon:.3f} "
+             f"(éditer dans qc_screener/config.py). "
+             f"≈ 2h de route ≈ 150 km en ligne droite.",
+    )
+    include_no_coords = st.checkbox(
+        "Inclure annonces sans coordonnées", value=False,
+        help="Listings dont la latitude/longitude n'a pu être extraite.",
+    )
+
+    st.divider()
     st.markdown(
         "**Mise à jour:** relancer `qc-screener crawl ...` puis recharger cette page. "
         "L'app lit la même base SQLite que le CLI."
@@ -158,6 +180,15 @@ if not db_present():
     st.title("Aucune donnée disponible")
     st.write("Voir la barre latérale pour les commandes d'initialisation.")
     st.stop()
+
+
+def filter_by_distance(df: pd.DataFrame) -> pd.DataFrame:
+    """Applique le filtre de distance global de la barre latérale."""
+    if include_no_coords:
+        mask = df["distance_km"].isna() | (df["distance_km"] <= max_km)
+    else:
+        mask = df["distance_km"].notna() & (df["distance_km"] <= max_km)
+    return df[mask].copy()
 
 
 # ─────────────────────────────  Tabs  ─────────────────────────────
@@ -180,7 +211,12 @@ tab_apercu, tab_annonces, tab_carte, tab_aubaines, tab_analyse, tab_loyers, tab_
 
 with tab_apercu:
     st.header("Vue d'ensemble du catalogue")
-    df = load_listings()
+    df_all = load_listings()
+    df = filter_by_distance(df_all)
+    st.caption(
+        f"📍 Filtre actif: {len(df):,} / {len(df_all):,} annonces dans le rayon "
+        f"de {max_km} km."
+    )
 
     c1, c2, c3, c4 = st.columns(4)
     c1.metric("Annonces", f"{len(df):,}")
@@ -222,7 +258,7 @@ with tab_apercu:
 
 with tab_annonces:
     st.header("Toutes les annonces multilogement")
-    df = load_listings()
+    df = filter_by_distance(load_listings())
 
     f1, f2, f3, f4 = st.columns(4)
     sources = sorted(df["source"].dropna().unique().tolist())
@@ -244,7 +280,7 @@ with tab_annonces:
 
     st.caption(f"{len(view)} annonces correspondent aux filtres")
     cols = [
-        "source", "source_id", "city", "units", "year_built",
+        "source", "source_id", "city", "distance_km", "units", "year_built",
         "asking_price", "municipal_evaluation", "price_to_eval",
         "annual_gross_revenue", "mrb", "cf_per_door_month",
         "taxes_total", "land_share", "date_posted", "passes", "url",
@@ -253,6 +289,7 @@ with tab_annonces:
         view[cols],
         column_config={
             "url": st.column_config.LinkColumn("URL"),
+            "distance_km": st.column_config.NumberColumn("Distance (km)", format="%.0f"),
             "asking_price": st.column_config.NumberColumn("Prix", format="%.0f $"),
             "municipal_evaluation": st.column_config.NumberColumn("Éval", format="%.0f $"),
             "annual_gross_revenue": st.column_config.NumberColumn("Revenus an.", format="%.0f $"),
@@ -275,7 +312,7 @@ with tab_annonces:
 
 with tab_carte:
     st.header("Carte des annonces multi-logement")
-    df = load_listings()
+    df = filter_by_distance(load_listings())
     geo = df.dropna(subset=["lat", "lon"]).copy()
     st.caption(f"{len(geo)} / {len(df)} annonces géolocalisées")
 
@@ -357,7 +394,7 @@ with tab_carte:
 
 with tab_aubaines:
     st.header("Aubaines — bottom-X% par prix/évaluation")
-    df = load_listings()
+    df = filter_by_distance(load_listings())
     eligibles = df.dropna(subset=["price_to_eval"]).copy()
     st.caption(f"{len(eligibles)} annonces ont une évaluation municipale dans la base")
 
@@ -433,7 +470,7 @@ with tab_aubaines:
 
 with tab_analyse:
     st.header("Analyseur de deal")
-    df = load_listings()
+    df = filter_by_distance(load_listings())
     if df.empty:
         st.info("Aucune annonce.")
     else:

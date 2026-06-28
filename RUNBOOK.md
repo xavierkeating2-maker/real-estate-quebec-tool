@@ -66,11 +66,44 @@ The Registre foncier CSVs (CC-BY, Données Québec) update ~monthly:
 
 ---
 
-## 4. Cheatsheet — common runs
+## 4. Geographic filter (distance from home)
+
+A global **distance-from-home filter** scopes the catalog to listings within driving range. Configured in `qc_screener/config.py` → `LocationFilter`:
+
+```python
+home_lat = 45.5019    # Grand Montréal centroid — edit to your address
+home_lon = -73.5674
+max_km   = 175.0      # haversine (straight-line); 175 km ≈ Gatineau
+```
+
+**To pin to your actual address:** Google Maps → right-click your house → "What's here?" → copy lat/lon into the config file. Restart Streamlit afterward.
+
+**Reference distances from the default centroid:**
+
+| City             | km  | In default (175 km) |
+|------------------|----:|:-------------------:|
+| Laval            |  16 | ✓                   |
+| Trois-Rivières   | 123 | ✓                   |
+| Sherbrooke       | 131 | ✓                   |
+| Gatineau         | 166 | ✓                   |
+| Québec ville     | 233 | ✗                   |
+| Saguenay         | 377 | ✗                   |
+| Rimouski         | 504 | ✗                   |
+
+**Where it applies:**
+- **Streamlit** — sidebar slider (📍 Filtre géographique) overrides the config default; every tab (Aperçu, Annonces, Carte, Aubaines, Analyseur) respects it.
+- **CLI** — `run` and `value` accept `--max-km N` (use `--max-km 0` to disable).
+- Listings without lat/lon are excluded by default (toggle in sidebar to include them).
+
+---
+
+## 5. Cheatsheet — common runs
 
 ```bash
 # Browse the screener results in the terminal
-.venv/bin/qc-screener run --top 15                      # Lépine-screened table
+.venv/bin/qc-screener run --top 15                      # Lépine-screened table (default --max-km from config.py)
+.venv/bin/qc-screener run --top 15 --max-km 200         # widen radius
+.venv/bin/qc-screener run --top 15 --max-km 0           # disable distance filter entirely
 .venv/bin/qc-screener value --top 15                    # macro-weighted by default (distress + YoY tail-wind/headwind)
 .venv/bin/qc-screener value --top 10 --percentile 3     # tighter bottom 3%
 .venv/bin/qc-screener value --no-macro --top 15         # raw prix/eval, ignore region heat
@@ -102,7 +135,7 @@ export ANTHROPIC_API_KEY=sk-ant-...                                  # set once 
 
 ---
 
-## 5. Cache management
+## 6. Cache management
 
 Caches are URL-hashed files under `data/cache/<source>/`. No TTL — they persist until explicitly removed.
 
@@ -134,7 +167,7 @@ rm data/cache/duproprio/<that-hash>.html
 
 ---
 
-## 6. Sources & cadence
+## 7. Sources & cadence
 
 | Source         | Type            | Catalog size       | Throttle | Suggested cadence  |
 |----------------|-----------------|--------------------|----------|--------------------|
@@ -149,14 +182,16 @@ Source modules: `qc_screener/{duproprio,proprio_direct,centris,kijiji,logisquebe
 
 ---
 
-## 7. Streamlit — tabs and what they do
+## 8. Streamlit — tabs and what they do
 
 `.venv/bin/streamlit run streamlit_app.py` → http://localhost:8501
 
+**Sidebar global filter:** the "📍 Filtre géographique" slider (default from `LocationFilter.max_km` in `config.py`, currently 175 km) applies to every tab. Toggle "Inclure annonces sans coordonnées" to include listings whose lat/lon couldn't be extracted. See §4 for full details.
+
 | Tab                  | What it shows                                                   |
 |----------------------|-----------------------------------------------------------------|
-| 🏠 Aperçu            | Catalog totals, top-5 by prix/éval and MRB, source breakdown    |
-| 🔍 Annonces          | Filterable table (source, units, price), Lépine pass badge      |
+| 🏠 Aperçu            | Catalog totals (in-radius), top-5 by prix/éval and MRB          |
+| 🔍 Annonces          | Filterable table (source, units, price, distance), Lépine badge |
 | 🗺️ Carte             | OpenStreetMap with all geolocated listings, colorable by metric |
 | 💎 Aubaines          | Scatter prix/éval × MRB, Lépine sweet-spot shaded               |
 | 📊 Analyseur de deal | Pick a listing, slide offer/financing/unit-mix → live projection|
@@ -168,21 +203,22 @@ Data refreshes when the SQLite file changes. Reload the browser tab after a craw
 
 ---
 
-## 8. Troubleshooting
+## 9. Troubleshooting
 
 | Symptom | Likely cause | Fix |
 |---|---|---|
 | `qc-screener: command not found` | venv not active or not installed | `cd ~/projects/real-estate-quebec-tool && .venv/bin/pip install -e .` |
 | `Annonce <id> introuvable` from `analyze-deal` | Listing not in DB | Run `crawl` first |
-| Aubaines chart axes look broken | Garbage placeholder values in DB | Look in §5 to bust the offending source's cache, then re-crawl |
+| Aubaines chart axes look broken | Garbage placeholder values in DB | Look in §6 to bust the offending source's cache, then re-crawl |
 | Streamlit shows old data after crawl | Browser cached the page | Hard refresh (⌘⇧R on macOS) |
 | Kijiji crawler returns 0 listings | They updated their Next.js shape | `dump` a search URL and inspect `__NEXT_DATA__` |
 | Centris returns 429 | Throttled by their server | Wait 10+ min, drop max-pages |
 | Aucun comparable pour cette ville | No rent-comp cohort meets `min_samples` | Lower `--min-samples` or crawl more rents |
+| Tabs show 0 listings but DB has many | Distance filter excluding everything | Bump sidebar "Distance max" slider, or edit `home_lat`/`home_lon` in `qc_screener/config.py` |
 
 ---
 
-## 9. Adding a new scraper source
+## 10. Adding a new scraper source
 
 Checklist (so the new source plugs into everything cleanly):
 

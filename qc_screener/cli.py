@@ -6,7 +6,8 @@ from rich.table import Table
 
 from . import centris, duproprio, kijiji, llm_extract, logisquebec, market, proprio_direct, registre_foncier, regions as regions_mod, storage
 from .analyzer import DealInputs, analyze
-from .config import LepineCriteria
+from .config import LepineCriteria, LocationFilter
+from .geo import haversine_km
 from .lepine import compute_metrics, screen
 from .models import Listing
 from rich.panel import Panel
@@ -57,9 +58,14 @@ def run(
     db: Path = typer.Option(DEFAULT_DB, help="Chemin de la base SQLite"),
     top: int = typer.Option(15, help="Limite d'affichage (annonces triees par score)"),
     min_checks: int = typer.Option(2, help="Min de checks evaluables pour afficher"),
+    max_km: float = typer.Option(
+        LocationFilter().max_km,
+        help="Distance max (km, vol d'oiseau) depuis la maison configuree dans config.py. 0 = pas de filtre.",
+    ),
 ) -> None:
     """Applique les filtres Lepine; affiche les meilleures annonces (tri score desc)."""
     criteria = LepineCriteria()
+    loc = LocationFilter()
     conn = storage.connect(db)
     rows = conn.execute("SELECT payload FROM listings").fetchall()
     if not rows:
@@ -68,8 +74,18 @@ def run(
 
     results = []
     passed = 0
+    n_skipped_distance = 0
     for (payload,) in rows:
         listing = Listing.model_validate_json(payload)
+        if max_km > 0 and listing.lat is not None and listing.lon is not None:
+            dist = haversine_km(loc.home_lat, loc.home_lon, listing.lat, listing.lon)
+            if dist > max_km:
+                n_skipped_distance += 1
+                continue
+        elif max_km > 0:
+            # Pas de coords → exclus quand le filtre distance est actif.
+            n_skipped_distance += 1
+            continue
         verdict = screen(listing, criteria)
         storage.save_verdict(conn, listing.source, verdict)
         n_decided = sum(1 for v in verdict.checks.values() if v is not None)
@@ -99,8 +115,11 @@ def run(
             "[green]oui[/green]" if verdict.passes else "[red]non[/red]",
         )
     console.print(table)
+    suffix = ""
+    if max_km > 0 and n_skipped_distance:
+        suffix = f" ({n_skipped_distance} hors rayon {max_km:.0f}km)"
     console.print(
-        f"\n[bold]{passed}/{len(rows)}[/bold] passent (criteria relaxes). "
+        f"\n[bold]{passed}/{len(rows) - n_skipped_distance}[/bold] passent (criteria relaxes){suffix}. "
         f"Score format: pct-pass(nb-checks-evaluables)."
     )
 
@@ -114,6 +133,10 @@ def value(
     no_macro: bool = typer.Option(False, help="Desactive la ponderation par signal macro regional"),
     yoy_weight: float = typer.Option(0.02, help="Poids du YoY transferts (par %point)"),
     distress_weight: float = typer.Option(1.0, help="Poids du ratio distress (en fraction)"),
+    max_km: float = typer.Option(
+        LocationFilter().max_km,
+        help="Distance max (km, vol d'oiseau) depuis la maison. 0 = pas de filtre.",
+    ),
 ) -> None:
     """Classe les annonces par ratio prix/evaluation municipale ascendant.
 
@@ -122,6 +145,7 @@ def value(
     bas obtiennent un coup de pouce.
     """
     criteria = LepineCriteria()
+    loc = LocationFilter()
     conn = storage.connect(db)
     rows = conn.execute("SELECT payload FROM listings").fetchall()
 
@@ -139,6 +163,11 @@ def value(
         listing = Listing.model_validate_json(payload)
         if listing.units and listing.units < min_units:
             continue
+        if max_km > 0:
+            if listing.lat is None or listing.lon is None:
+                continue
+            if haversine_km(loc.home_lat, loc.home_lon, listing.lat, listing.lon) > max_km:
+                continue
         m = compute_metrics(listing, criteria)
         if m.price_to_eval is None:
             continue

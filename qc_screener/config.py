@@ -32,3 +32,19 @@ class LepineCriteria:
     down_payment_ratio: float = 0.20       # 20% (residentiel 4 logements et moins)
     mortgage_rate: float = 0.055           # taux hypothecaire annuel
     amortization_years: int = 25
+
+
+@dataclass(frozen=True)
+class LocationFilter:
+    """Filtre geographique — n'affiche que les annonces dans un rayon de la maison.
+
+    Distance calculee a vol d'oiseau (haversine). Pour ~2h de route au QC,
+    150 km est un bon depart, mais varie beaucoup: 150 km au sud-ouest sur
+    le 20 (route droite) vs. 100 km au nord dans les Laurentides (sinueux).
+    Ajuster a la main ou via le slider Streamlit / l'option --max-km du CLI.
+    """
+    # Centroide Grand Montreal — remplacer par votre adresse precise si voulu.
+    home_lat: float = 45.5019
+    home_lon: float = -73.5674
+    # Rayon a vol d'oiseau (km). 175 inclut Gatineau (166 km).
+    max_km: float = 175.0
