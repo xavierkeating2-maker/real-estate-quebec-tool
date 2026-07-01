@@ -18,9 +18,10 @@ CREATE TABLE IF NOT EXISTS verdicts (
     source TEXT NOT NULL,
     source_id TEXT NOT NULL,
     run_at TEXT NOT NULL,
-    passes INTEGER NOT NULL,
+    passes INTEGER NOT NULL,        -- 1 si status='pass', sinon 0 (conserve pour les anciennes queries)
     score REAL NOT NULL,
     payload TEXT NOT NULL,
+    status TEXT,                    -- 'pass' | 'pass_partial' | 'fail' (ajoute apres coup)
     PRIMARY KEY (source, source_id, run_at)
 );
 CREATE TABLE IF NOT EXISTS rent_comps (
@@ -42,6 +43,11 @@ def connect(db_path: str | Path) -> sqlite3.Connection:
     Path(db_path).parent.mkdir(parents=True, exist_ok=True)
     conn = sqlite3.connect(db_path)
     conn.executescript(SCHEMA)
+    # Migration ad-hoc: ajouter `status` aux verdicts existants si absent.
+    cols = [r[1] for r in conn.execute("PRAGMA table_info(verdicts)").fetchall()]
+    if "status" not in cols:
+        conn.execute("ALTER TABLE verdicts ADD COLUMN status TEXT")
+        conn.commit()
     return conn
 
 
@@ -106,15 +112,16 @@ def renormalize_cities(conn: sqlite3.Connection) -> int:
 
 def save_verdict(conn: sqlite3.Connection, source: str, verdict: ScreenVerdict) -> None:
     conn.execute(
-        "INSERT INTO verdicts (source, source_id, run_at, passes, score, payload) "
-        "VALUES (?, ?, ?, ?, ?, ?)",
+        "INSERT INTO verdicts (source, source_id, run_at, passes, score, payload, status) "
+        "VALUES (?, ?, ?, ?, ?, ?, ?)",
         (
             source,
             verdict.listing_source_id,
             datetime.now(timezone.utc).isoformat(),
-            1 if verdict.passes else 0,
+            1 if verdict.status == "pass" else 0,
             verdict.score,
             verdict.model_dump_json(),
+            verdict.status,
         ),
     )
     conn.commit()

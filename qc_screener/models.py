@@ -1,6 +1,9 @@
 from datetime import datetime
+from typing import Literal
 
 from pydantic import BaseModel, Field, HttpUrl
+
+ScreenStatus = Literal["pass", "pass_partial", "fail"]
 
 
 class Listing(BaseModel):
@@ -96,7 +99,10 @@ class RentComp(BaseModel):
 
 class ScreenVerdict(BaseModel):
     listing_source_id: str
-    passes: bool
+    # "pass"         = MRB evaluable et passe + autres checks evalues passent
+    # "pass_partial" = prix/eval passe mais MRB non evaluable (revenu non divulgue)
+    # "fail"         = au moins un check evalue echoue, ou aucun check financier ne passe
+    status: ScreenStatus
     score: float                         # 0..1, sur les checks evaluables
     checks: dict[str, bool | None]       # None = donnee manquante
     reasons: list[str]

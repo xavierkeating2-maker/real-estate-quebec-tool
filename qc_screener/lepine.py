@@ -80,19 +80,30 @@ def screen(listing: Listing, c: LepineCriteria) -> ScreenVerdict:
 
     decided = [v for v in checks.values() if v is not None]
     score = (sum(1 for v in decided if v) / len(decided)) if decided else 0.0
-    # "Passe" exige qu'au moins un check financier soit evaluable ET reussi —
-    # sinon min_units seul (sans MRB ni cashflow ni prix/eval) n'est pas un signal.
+    # Statut a trois niveaux:
+    #   - "fail"         : aucun check decide, ou un check decide echoue, ou
+    #                      aucun check financier ne passe.
+    #   - "pass_partial" : prix/eval ou cashflow passe MAIS MRB non evaluable
+    #                      (revenu non divulgue) — drapeau "potentiel,
+    #                      mais on n'a pas pu calculer le metric coeur de Lepine".
+    #   - "pass"         : MRB evaluable et passe (avec les autres checks decides).
     financial_keys = {"mrb", "price_to_eval", "cashflow_per_door"}
     financial_decided = [k for k in financial_keys if checks.get(k) is not None]
-    passes = (
-        bool(decided)
-        and all(decided)
-        and any(checks[k] for k in financial_decided)
-    )
+    any_financial_passes = any(checks[k] for k in financial_decided)
+    all_decided_pass = bool(decided) and all(decided)
+
+    if not all_decided_pass or not any_financial_passes:
+        status = "fail"
+    elif checks.get("mrb") is True:
+        status = "pass"
+    else:
+        # Au moins prix/eval ou cashflow passe, mais MRB n'est pas evaluable.
+        status = "pass_partial"
+        reasons.append("MRB non calculable — revenu non divulgue par le vendeur")
 
     return ScreenVerdict(
         listing_source_id=listing.source_id,
-        passes=passes,
+        status=status,
         score=round(score, 2),
         checks=checks,
         reasons=reasons,

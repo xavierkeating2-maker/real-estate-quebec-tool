@@ -84,7 +84,7 @@ def load_listings() -> pd.DataFrame:
             "price_to_eval": m.price_to_eval,
             "cf_per_door_month": m.estimated_cashflow_per_door_month,
             "score": v.score,
-            "passes": v.passes,
+            "status": v.status,
             "fetched_at": L.fetched_at,
             "lat": L.lat,
             "lon": L.lon,
@@ -218,11 +218,12 @@ with tab_apercu:
         f"de {max_km} km."
     )
 
-    c1, c2, c3, c4 = st.columns(4)
+    c1, c2, c3, c4, c5 = st.columns(5)
     c1.metric("Annonces", f"{len(df):,}")
     c2.metric("Avec évaluation municipale", int(df["price_to_eval"].notna().sum()))
     c3.metric("Avec revenus divulgués", int(df["mrb"].notna().sum()))
-    c4.metric("Passent Lépine relâché", int(df["passes"].sum()))
+    c4.metric("✅ Passent Lépine", int((df["status"] == "pass").sum()))
+    c5.metric("⚠️ Partiels (revenu inconnu)", int((df["status"] == "pass_partial").sum()))
 
     st.divider()
 
@@ -279,11 +280,13 @@ with tab_annonces:
     view = df[mask].copy().sort_values("price_to_eval")
 
     st.caption(f"{len(view)} annonces correspondent aux filtres")
+    STATUS_BADGE = {"pass": "✅ Pass", "pass_partial": "⚠️ Partiel", "fail": "❌"}
+    view = view.assign(status_badge=view["status"].map(STATUS_BADGE).fillna("—"))
     cols = [
         "source", "source_id", "city", "distance_km", "units", "year_built",
         "asking_price", "municipal_evaluation", "price_to_eval",
         "annual_gross_revenue", "mrb", "cf_per_door_month",
-        "taxes_total", "land_share", "date_posted", "passes", "url",
+        "taxes_total", "land_share", "date_posted", "status_badge", "url",
     ]
     st.dataframe(
         view[cols],
@@ -299,7 +302,10 @@ with tab_annonces:
             "taxes_total": st.column_config.NumberColumn("Taxes/an", format="%.0f $"),
             "land_share": st.column_config.NumberColumn("% Terrain", format="percent"),
             "date_posted": st.column_config.DatetimeColumn("Affichée"),
-            "passes": st.column_config.CheckboxColumn("Lépine"),
+            "status_badge": st.column_config.TextColumn(
+                "Lépine",
+                help="✅ Pass = MRB + prix/éval OK · ⚠️ Partiel = prix/éval OK mais revenu non divulgué (MRB incalculable) · ❌ Fail",
+            ),
         },
         hide_index=True,
         use_container_width=True,
@@ -348,9 +354,17 @@ with tab_carte:
     elif color_by == "Source":
         color_kwargs = dict(color="source")
     elif color_by == "Passe Lépine":
-        plot["color"] = plot["passes"].map({True: "oui", False: "non"})
+        plot["color"] = plot["status"].map({
+            "pass": "✅ Pass",
+            "pass_partial": "⚠️ Partiel",
+            "fail": "❌ Fail",
+        }).fillna("❌ Fail")
         color_kwargs = dict(color="color",
-                            color_discrete_map={"oui": "#2ecc71", "non": "#e74c3c"})
+                            color_discrete_map={
+                                "✅ Pass": "#2ecc71",
+                                "⚠️ Partiel": "#f1c40f",
+                                "❌ Fail": "#e74c3c",
+                            })
 
     if plot.empty:
         st.info("Aucune annonce à afficher avec ces filtres.")

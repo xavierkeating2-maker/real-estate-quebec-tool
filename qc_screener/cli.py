@@ -89,7 +89,7 @@ def run(
         verdict = screen(listing, criteria)
         storage.save_verdict(conn, listing.source, verdict)
         n_decided = sum(1 for v in verdict.checks.values() if v is not None)
-        if verdict.passes:
+        if verdict.status == "pass":
             passed += 1
         results.append((listing, verdict, n_decided))
 
@@ -97,8 +97,13 @@ def run(
     results.sort(key=lambda r: (r[1].score, r[2]), reverse=True)
     shown = [r for r in results if r[2] >= min_checks][:top]
 
+    status_badge = {
+        "pass":         "[green]✓ oui[/green]",
+        "pass_partial": "[yellow]~ partiel[/yellow]",
+        "fail":         "[red]✗ non[/red]",
+    }
     table = Table(title=f"Screener Lepine (top {len(shown)}/{len(rows)})")
-    for col in ("ID", "Logts", "Prix", "MRB", "$/porte", "CF/porte", "Eval%", "Score", "Pass"):
+    for col in ("ID", "Logts", "Prix", "MRB", "$/porte", "CF/porte", "Eval%", "Score", "Statut"):
         table.add_column(col)
     for listing, verdict, n in shown:
         m = verdict.metrics
@@ -112,14 +117,17 @@ def run(
             if m.estimated_cashflow_per_door_month is not None else "-",
             f"{m.price_to_eval:.2f}" if m.price_to_eval else "-",
             f"{verdict.score:.2f}({n})",
-            "[green]oui[/green]" if verdict.passes else "[red]non[/red]",
+            status_badge[verdict.status],
         )
     console.print(table)
+    n_partial = sum(1 for _, v, _ in results if v.status == "pass_partial")
     suffix = ""
     if max_km > 0 and n_skipped_distance:
         suffix = f" ({n_skipped_distance} hors rayon {max_km:.0f}km)"
     console.print(
-        f"\n[bold]{passed}/{len(rows) - n_skipped_distance}[/bold] passent (criteria relaxes){suffix}. "
+        f"\n[bold green]{passed}[/bold green] passent / "
+        f"[bold yellow]{n_partial}[/bold yellow] partiels (revenu non divulgue) "
+        f"/ [dim]{len(rows) - n_skipped_distance}[/dim] analyses{suffix}. "
         f"Score format: pct-pass(nb-checks-evaluables)."
     )
 
