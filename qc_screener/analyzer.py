@@ -139,6 +139,49 @@ def cmhc_premium_rate(down_pct: float, units: int) -> float:
     return 0.0
 
 
+def estimate_expense_ratio(units: int | None, year_built: int | None) -> tuple[float, str]:
+    """Retourne (ratio, label_source) — un ratio depenses/revenus par defaut
+    base sur la methode Lepine (progression par nb de logts) + un ajustement
+    modeste pour l'age du batiment.
+
+    Progressions (Lepine, L'independance financiere grace a l'immobilier):
+        <=6 logts   40%
+        7-12        35%
+        13-24       30%
+        25+         27%
+
+    Ajustements:
+        bati < 1980  +3pp  (entretien plus lourd, plomberie/electrique vieux)
+        bati > 2010  -2pp  (equipements neufs, faible capex court terme)
+
+    Cap: [0.25, 0.50]. Ces chiffres restent des heuristiques — le pipeline
+    empirique (depuis nos donnees) est bloque tant que les scrapers ne
+    capturent pas `annual_expenses` (0/861 aujourd'hui).
+    """
+    if not units or units <= 6:
+        base, tier = 0.40, "<=6u"
+    elif units <= 12:
+        base, tier = 0.35, "7-12u"
+    elif units <= 24:
+        base, tier = 0.30, "13-24u"
+    else:
+        base, tier = 0.27, "25+u"
+
+    adj_notes: list[str] = []
+    if year_built and year_built < 1980:
+        base += 0.03
+        adj_notes.append(f"bati {year_built} <1980 +3pp")
+    elif year_built and year_built > 2010:
+        base -= 0.02
+        adj_notes.append(f"bati {year_built} >2010 -2pp")
+
+    base = max(0.25, min(0.50, base))
+    label = f"Lepine {tier}"
+    if adj_notes:
+        label += f" ({', '.join(adj_notes)})"
+    return base, label
+
+
 def irr(cashflows: list[float], guess: float = 0.10) -> float | None:
     """Taux de rendement interne via Newton (iteration sur NPV)."""
     if not cashflows or all(cf == 0 for cf in cashflows):
@@ -169,10 +212,12 @@ def _snapshot(d: DealInputs, year: int, mortgage_principal: float,
         base_expenses = d.annual_expenses
     else:
         ratio_based = d.gross_annual_revenue * d.expense_ratio
-        # Si on connait les taxes, on les ajoute aux autres depenses (estimees a
-        # 25% des revenus pour entretien/assurance/etc.) plutot que le 40% bloc.
+        # Si on connait les taxes: taxes + (ratio - ~15%) × revenus pour le
+        # reste (entretien, assurance, services, etc.). Le ~15% correspond a
+        # la part typique des taxes dans le budget d'un multilog QC.
         if d.known_taxes is not None:
-            base_expenses = d.known_taxes + d.gross_annual_revenue * 0.25
+            non_tax_ratio = max(0.10, d.expense_ratio - 0.15)
+            base_expenses = d.known_taxes + d.gross_annual_revenue * non_tax_ratio
             base_expenses = max(base_expenses, ratio_based * 0.7)  # plancher
         else:
             base_expenses = ratio_based

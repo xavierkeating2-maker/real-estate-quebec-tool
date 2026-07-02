@@ -35,6 +35,13 @@ PRICE_BANDS = {
     "3": "Plus de 500 000 $",
 }
 
+# Points milieux pour approximer un prix moyen pondere a partir des parts de bande.
+# Band 3 est non-bornee superieurement; 700K est une estimation raisonnable de la
+# moyenne des transactions >500K au QC (skewed vers les petites metropoles).
+# Le YoY de la moyenne ponderee capte la derive de la distribution — proxy pour
+# l'appreciation, avec une marge d'erreur d'au moins ±1 point de pourcentage.
+BAND_MIDPOINTS = {"1": 175_000.0, "2": 375_000.0, "3": 700_000.0}
+
 # Régions administratives du Québec.
 REGIONS: dict[str, str] = {
     "01": "Bas-Saint-Laurent",
@@ -164,6 +171,21 @@ def region_stats(months: int = 12) -> list[dict]:
         share_recent = {b: (band_counts_recent[b] / total_recent) if total_recent else None for b in PRICE_BANDS}
         share_prior = {b: (band_counts_prior[b] / total_prior) if total_prior else None for b in PRICE_BANDS}
 
+        # Prix moyen pondere par bande = proxy d'un prix median. YoY = proxy
+        # d'appreciation. La bande 3 est non-bornee, donc c'est une approximation
+        # (±1pp de marge d'erreur) mais region-specifique et derivee de nos donnees.
+        def weighted_price(shares: dict[str, float | None]) -> float | None:
+            if any(s is None for s in shares.values()):
+                return None
+            return sum(shares[b] * BAND_MIDPOINTS[b] for b in shares)
+
+        price_recent = weighted_price(share_recent)
+        price_prior = weighted_price(share_prior)
+        price_yoy = (
+            (price_recent - price_prior) / price_prior * 100
+            if (price_recent is not None and price_prior) else None
+        )
+
         rows.append({
             "region_id": rid,
             "region": name,
@@ -180,7 +202,21 @@ def region_stats(months: int = 12) -> list[dict]:
                 (share_recent["1"] - share_prior["1"]) * 100
                 if (share_recent["1"] is not None and share_prior["1"] is not None) else None
             ),
+            "price_proxy_recent": price_recent,
+            "price_proxy_prior": price_prior,
+            "price_yoy_pct": price_yoy,
             "fenetre_debut": recent[0] if recent else None,
             "fenetre_fin": recent[-1] if recent else None,
         })
     return rows
+
+
+def region_appreciation_estimate(region_name: str | None, months: int = 12) -> float | None:
+    """Retourne le taux d'appreciation annuel (fraction, ex 0.042 = 4.2%) pour
+    une region donnee, derivé de `region_stats()`. None si data indisponible."""
+    if not region_name:
+        return None
+    for r in region_stats(months=months):
+        if r["region"] == region_name and r["price_yoy_pct"] is not None:
+            return r["price_yoy_pct"] / 100.0
+    return None

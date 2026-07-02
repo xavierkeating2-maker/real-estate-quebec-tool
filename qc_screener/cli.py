@@ -4,8 +4,8 @@ import typer
 from rich.console import Console
 from rich.table import Table
 
-from . import centris, duproprio, kijiji, llm_extract, logisquebec, market, proprio_direct, registre_foncier, regions as regions_mod, storage
-from .analyzer import DealInputs, analyze
+from . import centris, duproprio, kijiji, llm_extract, logisquebec, market, proprio_direct, registre_foncier, regions as regions_mod, schl, storage
+from .analyzer import DealInputs, analyze, estimate_expense_ratio
 from .config import LepineCriteria, LocationFilter
 from .geo import haversine_km
 from .lepine import compute_metrics, screen
@@ -333,6 +333,22 @@ def analyze_deal(
     am_years: int = typer.Option(25, help="Amortissement (annees)"),
     vtb_pct: float = typer.Option(0.0, help="Balance de vente % du prix d'achat"),
     vtb_rate: float = typer.Option(7.0, help="Taux balance de vente %"),
+    appreciation: float = typer.Option(
+        -1.0,
+        help="Appreciation annuelle %. -1 = auto (regional Registre foncier), sinon override.",
+    ),
+    vacancy: float = typer.Option(
+        -1.0,
+        help="Taux d'inoccupation %. -1 = auto (SCHL par ville), sinon override.",
+    ),
+    rent_growth: float = typer.Option(
+        -1.0,
+        help="Croissance annuelle des loyers %. -1 = auto (SCHL CAGR 3a), sinon override.",
+    ),
+    expense_ratio: float = typer.Option(
+        -1.0,
+        help="Ratio depenses/revenus %. -1 = auto (Lepine tiere par nb logts + age), sinon override.",
+    ),
     db: Path = typer.Option(DEFAULT_DB, help="Chemin de la base SQLite"),
 ) -> None:
     """Analyse complete d'un deal: TGA, cashflow, mise de fonds, projection 5 ans."""
@@ -390,6 +406,62 @@ def analyze_deal(
     if tax_total > 0:
         known_taxes = tax_total
 
+    # Appreciation regionale (Registre foncier) — override si l'utilisateur en fournit une.
+    canonical_region = regions_mod.normalize_region(listing.region, listing.city)
+    appreciation_source = "defaut 2.5%"
+    if appreciation >= 0:
+        appreciation_frac = appreciation / 100
+        appreciation_source = f"override CLI ({appreciation:.1f}%)"
+    else:
+        try:
+            regional = registre_foncier.region_appreciation_estimate(canonical_region)
+        except Exception:
+            regional = None
+        if regional is not None:
+            appreciation_frac = regional
+            appreciation_source = f"Registre foncier {canonical_region} 12mo ({regional*100:.1f}%)"
+        else:
+            appreciation_frac = 0.025
+
+    # Vacance SCHL par ville — override si l'utilisateur en fournit une.
+    vacancy_source = "defaut 5.0%"
+    if vacancy >= 0:
+        vacancy_frac = vacancy / 100
+        vacancy_source = f"override CLI ({vacancy:.1f}%)"
+    else:
+        try:
+            v = schl.vacancy_rate_estimate(listing.city)
+        except Exception:
+            v = None
+        if v is not None:
+            vacancy_frac, vacancy_source = v
+        else:
+            vacancy_frac = 0.05
+
+    # Croissance des loyers (SCHL CAGR 3a) — override si l'utilisateur en fournit un.
+    rent_growth_source = "defaut 2.5%"
+    if rent_growth >= 0:
+        rent_growth_frac = rent_growth / 100
+        rent_growth_source = f"override CLI ({rent_growth:.1f}%)"
+    else:
+        try:
+            g = schl.rent_growth_estimate(listing.city)
+        except Exception:
+            g = None
+        if g is not None:
+            rent_growth_frac, rent_growth_source = g
+        else:
+            rent_growth_frac = 0.025
+
+    # Ratio depenses/revenus (Lepine tiere + ajustement age) — override CLI si fourni.
+    if expense_ratio >= 0:
+        expense_ratio_frac = expense_ratio / 100
+        expense_ratio_source = f"override CLI ({expense_ratio:.1f}%)"
+    else:
+        expense_ratio_frac, expense_ratio_source = estimate_expense_ratio(
+            listing.units, listing.year_built
+        )
+
     inputs = DealInputs(
         purchase_price=offer or listing.asking_price or 0.0,
         units=listing.units,
@@ -402,6 +474,10 @@ def analyze_deal(
         vtb_pct=vtb_pct / 100,
         vtb_rate=vtb_rate / 100,
         initial_capex=capex,
+        annual_appreciation=appreciation_frac,
+        vacancy_rate=vacancy_frac,
+        annual_rent_growth=rent_growth_frac,
+        expense_ratio=expense_ratio_frac,
     )
     if inputs.purchase_price <= 0 or inputs.gross_annual_revenue <= 0:
         console.print("[red]Prix d'achat et revenus stabilises requis.[/red]")
@@ -432,6 +508,10 @@ def analyze_deal(
         f"Capex initial:   {inputs.initial_capex:>12,.0f} $\n"
         f"Financement:     MdF {down_pct:.0f}%  |  Hypo {rate:.2f}% am{am_years}"
         + (f"  |  BdV {vtb_pct:.0f}% @ {vtb_rate:.2f}%" if vtb_pct > 0 else "")
+        + f"\nApreciation:     {appreciation_frac*100:>+5.2f} %/an  [dim]({appreciation_source})[/dim]"
+        + f"\nVacance:         {vacancy_frac*100:>+5.2f} %/an  [dim]({vacancy_source})[/dim]"
+        + f"\nLoyer +/an:      {rent_growth_frac*100:>+5.2f} %/an  [dim]({rent_growth_source})[/dim]"
+        + f"\nDep./Revenus:    {expense_ratio_frac*100:>+5.2f} %    [dim]({expense_ratio_source})[/dim]"
     )
     console.print(Panel(header, title="Hypotheses", border_style="cyan"))
 
@@ -510,6 +590,38 @@ def analyze_deal(
         f"[dim](cashflow + gain d'avoir / capital investi)[/dim]"
     )
     console.print(Panel(returns, title="Retours", border_style="green"))
+
+
+schl_app = typer.Typer(help="Vacance + croissance loyer (SCHL via StatCan)")
+app.add_typer(schl_app, name="schl")
+
+
+@schl_app.command("refresh")
+def schl_refresh(force: bool = typer.Option(False, help="Force le re-telechargement")) -> None:
+    """Telecharge les tables StatCan (vacance RMR + AR, loyers moyens)."""
+    counts = schl.refresh(force=force)
+    for tid, n in counts.items():
+        console.print(f"[green]ok[/green] table {tid}: {n:,} lignes")
+    last = schl.last_refresh_at()
+    if last:
+        console.print(f"[dim]Dernier refresh: {last}[/dim]")
+
+
+@schl_app.command("lookup")
+def schl_lookup(
+    city: str = typer.Argument(..., help="Ville (ex 'Montréal', 'Rimouski')"),
+) -> None:
+    """Affiche la vacance et la croissance de loyer pour une ville."""
+    v = schl.vacancy_rate_estimate(city)
+    g = schl.rent_growth_estimate(city)
+    if v:
+        console.print(f"[cyan]Vacance:[/cyan]        {v[0]*100:.2f}%  ({v[1]})")
+    else:
+        console.print(f"[yellow]Vacance:[/yellow] aucune donnee (lancer `schl refresh`)")
+    if g:
+        console.print(f"[cyan]Croissance loyer:[/cyan] {g[0]*100:.2f}%/an  ({g[1]})")
+    else:
+        console.print(f"[yellow]Croissance loyer:[/yellow] aucune donnee")
 
 
 macro_app = typer.Typer(help="Signaux macro régionaux (Registre foncier QC)")

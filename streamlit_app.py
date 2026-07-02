@@ -16,14 +16,14 @@ import pandas as pd
 import plotly.express as px
 import streamlit as st
 
-from qc_screener.analyzer import DealInputs, analyze, sensitivity
+from qc_screener.analyzer import DealInputs, analyze, sensitivity, estimate_expense_ratio
 from qc_screener.cities import normalize_city
 from qc_screener.config import LepineCriteria, LocationFilter
 from qc_screener.geo import haversine_km
 from qc_screener.lepine import compute_metrics, screen
 from qc_screener.market import estimate_market_revenue
 from qc_screener.models import Listing
-from qc_screener import registre_foncier
+from qc_screener import regions as regions_mod, registre_foncier, schl
 
 DB_PATH = Path("data/screener.db")
 
@@ -603,6 +603,77 @@ with tab_analyse:
         vtb_pct = f4.slider("Balance vente (%)", 0.0, 30.0, 0.0, step=1.0)
         vtb_rate = f5.slider("Taux balance (%)", 0.0, 12.0, 7.0, step=0.5)
 
+        # ─── Hypothèses de projection (défauts dérivés des sources) ───
+        # Convertir NaN → None avant les lookups (unicodedata refuse les floats).
+        raw_city = listing_row.get("city")
+        raw_region = listing_row.get("region")
+        listing_city = raw_city if isinstance(raw_city, str) and raw_city else None
+        listing_region = raw_region if isinstance(raw_region, str) and raw_region else None
+        canon_region = regions_mod.normalize_region(listing_region, listing_city)
+
+        # Défauts dynamiques
+        try:
+            appr_lookup = registre_foncier.region_appreciation_estimate(canon_region)
+        except Exception:
+            appr_lookup = None
+        appr_default = appr_lookup if appr_lookup is not None else 0.025
+        appr_source = (
+            f"Registre foncier {canon_region} 12mo"
+            if appr_lookup is not None else "défaut Lépine"
+        )
+
+        try:
+            vac_lookup = schl.vacancy_rate_estimate(listing_city)
+        except Exception:
+            vac_lookup = None
+        vac_default = vac_lookup[0] if vac_lookup else 0.05
+        vac_source = vac_lookup[1] if vac_lookup else "défaut 5%"
+
+        try:
+            rg_lookup = schl.rent_growth_estimate(listing_city)
+        except Exception:
+            rg_lookup = None
+        rg_default = rg_lookup[0] if rg_lookup else 0.025
+        rg_source = rg_lookup[1] if rg_lookup else "défaut 2.5%"
+
+        yb = int(listing_row["year_built"]) if pd.notna(listing_row.get("year_built")) else None
+        exp_default, exp_source = estimate_expense_ratio(units, yb)
+
+        with st.expander("🎛️ Hypothèses de projection (défauts dérivés)", expanded=False):
+            st.caption(
+                "Chaque curseur est initialisé à un défaut spécifique à la ville/région. "
+                "Ajuste manuellement pour tester des scénarios."
+            )
+            # Nonces basées sur le listing pour recréer les sliders quand on change
+            k = f"assumptions_{sid}"
+            hp1, hp2 = st.columns(2)
+            appr_slider = hp1.slider(
+                "Appréciation (%/an)", -5.0, 15.0, float(appr_default * 100), step=0.1,
+                key=f"appr_{k}", help=f"Défaut: {appr_source}",
+            )
+            hp1.caption(f"📊 {appr_source}")
+            vac_slider = hp2.slider(
+                "Vacance (%)", 0.0, 15.0, float(vac_default * 100), step=0.1,
+                key=f"vac_{k}", help=f"Défaut: {vac_source}",
+            )
+            hp2.caption(f"📊 {vac_source}")
+            hp3, hp4 = st.columns(2)
+            rg_slider = hp3.slider(
+                "Croissance loyers (%/an)", 0.0, 15.0, float(rg_default * 100), step=0.1,
+                key=f"rg_{k}", help=f"Défaut: {rg_source}",
+            )
+            hp3.caption(f"📊 {rg_source}")
+            exp_slider = hp4.slider(
+                "Ratio dépenses/revenus (%)", 25.0, 60.0, float(exp_default * 100), step=0.5,
+                key=f"exp_{k}", help=f"Défaut: {exp_source}",
+            )
+            hp4.caption(f"📊 {exp_source}")
+
+        appr_frac = appr_slider / 100
+        vac_frac = vac_slider / 100
+        rg_frac = rg_slider / 100
+        exp_frac = exp_slider / 100
+
         if breakdown:
             with st.expander("Ventilation par logement (marché)", expanded=False):
                 rows = []
@@ -632,6 +703,10 @@ with tab_analyse:
                 vtb_pct=vtb_pct / 100,
                 vtb_rate=vtb_rate / 100,
                 initial_capex=float(capex),
+                annual_appreciation=appr_frac,
+                vacancy_rate=vac_frac,
+                annual_rent_growth=rg_frac,
+                expense_ratio=exp_frac,
             )
             if known_taxes:
                 st.caption(
@@ -723,9 +798,9 @@ with tab_analyse:
                             row[f"{r:,.0f}"] = round(cell["tga"] * 100, 2)
                     rows.append(row)
                 sdf = pd.DataFrame(rows).set_index("Prix")
-                fmt_pct_cell = "%.2f%%" if metric != "Cashflow/porte/mois" else "%.0f $"
+                fmt_pct_cell = "{:.2f}%" if metric != "Cashflow/porte/mois" else "{:.0f} $"
                 st.dataframe(
-                    sdf.style.background_gradient(cmap="RdYlGn", axis=None).format(fmt_pct_cell),
+                    sdf.style.background_gradient(cmap="RdYlGn", axis=None).format(fmt_pct_cell, na_rep="—"),
                     use_container_width=True,
                 )
         else:

@@ -8,6 +8,14 @@ Each entry: a *filed date* (when the idea came up) and, if pursued, a *done date
 
 ## 🔲 To do
 
+
+### Automate new data fetches and notify for Lépiner passers
+
+
+### Automate deletion of sold or no-longer-available listings
+
+
+
 ### High-value data we already have but haven't parsed
 
 - **Per-unit rents from listing prose** *(filed 2026-06-21, partial 2026-06-22)*
@@ -26,6 +34,13 @@ Each entry: a *filed date* (when the idea came up) and, if pursued, a *done date
 
 ### New tools / sources
 
+- **Scrape declared `annual_expenses` from listings** *(filed 2026-07-02)*
+  Prerequisite for empirical expense-ratio cohorts. Currently 0/861 listings have `annual_expenses` populated (only revenues + taxes). Centris + PD typically list "Dépenses totales" or "Dépenses annuelles" in the financial detail table; DuProprio less consistent. Once 100+ listings have it, `analyzer.estimate_expense_ratio` can add an empirical branch (median declared_expenses / declared_revenue by units×region cohort) with fallback to the current Lépine tiered defaults.
+
+
+- **StatCan / Teranet HPI for cleaner appreciation** *(filed 2026-07-02)*
+  Current Registre foncier appreciation uses weighted band-midpoints (±1pp noise from the >500K band being unbounded). A cleaner alternative: pull the New Housing Price Index (StatCan Table 18-10-0205) or Teranet-NBC HPI by CMA. Would give a proper monthly HPI YoY per CMA. Adds ~1h of work for meaningfully lower noise. Only worth doing if the current signal proves too jumpy in practice.
+
 - **General assistant — the third tool** *(filed 2026-06-18)*
   Q&A surface that knows Lépine's method and the user's deal context. Useful once enough structured data flows through the screener and analyzer to ground answers.
 
@@ -37,6 +52,23 @@ Each entry: a *filed date* (when the idea came up) and, if pursued, a *done date
 ---
 
 ## ✅ Done
+
+### 2026-07-02
+
+- **Streamlit Analyseur — expander with the 4 dynamic-default sliders** *(filed 2026-07-02, done 2026-07-02)*
+  Added a "🎛️ Hypothèses de projection (défauts dérivés)" expander INSIDE the Analyseur tab (not the sidebar — sliders need per-listing dynamic defaults to work coherently). Four sliders (apprec, vacance, rent growth, expense ratio), each seeded from the same lookup as the CLI (`registre_foncier.region_appreciation_estimate`, `schl.vacancy_rate_estimate`, `schl.rent_growth_estimate`, `analyzer.estimate_expense_ratio`), with the source label shown as caption ("SCHL Montréal 2025", "Registre foncier Laurentides 12mo", etc.). Slider keys are namespaced by `sid` so switching listing resets the values to the new listing's regional defaults.
+
+- **Smarter expense ratio (Lépine tiered + age adjustment)** *(filed 2026-07-02, done 2026-07-02)*
+  New `analyzer.estimate_expense_ratio(units, year_built) -> (ratio, label)` implementing Lépine's own book progression: ≤6 units 40%, 7–12 35%, 13–24 30%, 25+ 27%, plus small age adjustments (pre-1980 +3pp, post-2010 −2pp), capped [25%, 50%]. CLI `analyze-deal` gained `--expense-ratio` (–1 = auto, positive % = override); Hypotheses panel prints the source. Also fixed a coherence bug: the "taxes + 25%" branch had a hardcoded 25% that was tied to the old 40% default — now derives non-tax portion from `expense_ratio - 15pp`, so the two branches move together when the ratio changes. **Not pursued: empirical from DB** (was the original plan). 0 of 861 listings have `annual_expenses` populated by our scrapers, so the empirical cohort has no data. Filed separately (below) as a prerequisite.
+
+- **Dynamic rent growth from SCHL rents (analyzer)** *(filed 2026-07-02, done 2026-07-02)*
+  Extended `qc_screener/schl.py` to also ingest StatCan Table 34-10-0133 (average rent by centre × bedroom × structure type). Filtered to "Row and apartment structures of 3 units and over" (matches Lépine multi-loger scope), averaged across bedroom types per (city, year), then computed a 3-year CAGR per city — smooths the 2024–2025 QC rent-shortage spike into something projectable. Function `rent_growth_estimate(city)` reuses the same satellite→CMA mapping as vacancy. Current CAGRs: Montréal +9.5%, Sherbrooke +9.6%, Trois-Rivières +15.5% (fastest CMA), Saguenay +2.8%, provincial median +8.5% (vs. old flat 2.5%). CLI `analyze-deal` gained `--rent-growth`; Hypotheses panel prints the source. **Bug caught & fixed:** initial `load_rates()` iterated every cached CSV including rents.csv (dollars), mixing rent $ into the vacancy dict — split by table_id.
+
+- **Dynamic vacancy rate from SCHL/StatCan (analyzer)** *(filed 2026-07-02, done 2026-07-02)*
+  New source module `qc_screener/schl.py` pulling StatCan Table 34-10-0127 (vacancy by RMR — Montréal 3.3%, Québec 2.6%, Sherbrooke 2.5%, Trois-Rivières 2.7%, Ottawa-Gatineau 4.6%, Saguenay 2.6%) and Table 34-10-0132 (vacancy by AR — 30 smaller centres). Both tables merged into a single `{city_norm: (year, rate)}` map covering 40 QC centres, plus a `SATELLITE_TO_CMA` table so Laval/Longueuil/Brossard inherit Montréal's rate, Lévis inherits Québec's, etc. Function `vacancy_rate_estimate(city)` returns `(fraction, source_label)` with fallback to province-wide average (~1.69%). CLI `analyze-deal` gained `--vacancy` (–1 = auto, positive % = override), Hypotheses panel shows the source. Deal 22564119 Saint-Hippolyte (no direct entry) now uses 1.69% instead of 5% — cashflow gains ~$1.5K/yr just from that change.
+
+- **Dynamic appreciation from Registre foncier (analyzer)** *(filed 2026-07-02, done 2026-07-02)*
+  Replaces the hardcoded `annual_appreciation=2.5%` with a region-specific YoY derived from `ventes_par_prix` band-share drift. Method: weighted midpoint per (region, 12-mo window) using band midpoints ($175K / $375K / $700K), YoY change = appreciation proxy. Added `price_proxy_recent`, `price_proxy_prior`, `price_yoy_pct` to `region_stats()` and a `region_appreciation_estimate(region_name)` helper. CLI `analyze-deal` now accepts `--appreciation` (–1 = auto-detect regional; positive % = override), and the Hypotheses panel prints which source was used. Current 12-mo signal: Mauricie +10.2%, Abitibi +8.1%, Laurentides +6.4%, Montréal +3.1% (vs. the old flat 2.5%). Deal 22564119 Saint-Hippolyte (Laurentides) now uses +6.4% instead of +2.5%. **Known limitation**: band 3 (>500K) is unbounded, so the midpoint anchor of $700K is a heuristic — the YoY has ±1pp of noise. See "SL slider for override" (below in To do). Reason we didn't use a cleaner source (StatCan HPI / Teranet): keeps everything from data we already ingest; can upgrade later.
 
 ### 2026-06-22
 

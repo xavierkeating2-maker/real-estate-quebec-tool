@@ -55,14 +55,23 @@ Cohort medians should refresh — verify:
 
 ---
 
-## 3. Monthly flow — macro signal
+## 3. Monthly flow — macro signals
 
-The Registre foncier CSVs (CC-BY, Données Québec) update ~monthly:
+Two datasets refresh at different cadences:
 
+**Registre foncier (CC-BY, Données Québec — ~monthly):**
 ```bash
-.venv/bin/qc-screener macro refresh --force   # force re-download
+.venv/bin/qc-screener macro refresh --force
 .venv/bin/qc-screener macro regions --months 12
 ```
+
+**SCHL/StatCan (annually ~March; safe to refresh monthly):**
+```bash
+.venv/bin/qc-screener schl refresh                  # ~5 s per table
+.venv/bin/qc-screener schl lookup Montréal          # verify a lookup
+```
+
+The analyzer reads BOTH: Registre foncier gives per-region appreciation, SCHL gives per-city vacancy and rent-growth CAGR.
 
 ---
 
@@ -109,12 +118,18 @@ max_km   = 175.0      # haversine (straight-line); 175 km ≈ Gatineau
 .venv/bin/qc-screener value --no-macro --top 15         # raw prix/eval, ignore region heat
 .venv/bin/qc-screener value --distress-weight 2.0       # tune macro weighting
 
-# Analyze a specific listing
-.venv/bin/qc-screener analyze-deal 22564119                          # auto-fills offer + market rents (default 2br per unit)
+# Analyze a specific listing (dynamic defaults: apprec/vacance/loyer/dépenses per city)
+.venv/bin/qc-screener analyze-deal 22564119                          # all auto: region → apprec, city → vac + rent growth, units+age → expense ratio
 .venv/bin/qc-screener analyze-deal 22564119 --offer 350000           # custom offer
 .venv/bin/qc-screener analyze-deal 22564119 --unit-mix 2,2,1         # custom unit mix
 .venv/bin/qc-screener analyze-deal 22564119 --vtb-pct 10 --vtb-rate 6.5  # vendor balance
 .venv/bin/qc-screener analyze-deal 22564119 --no-market              # use listing's reported revenue, skip cohort lookup
+
+# Override dynamic assumptions (each defaults to -1 = auto)
+.venv/bin/qc-screener analyze-deal 22564119 --appreciation 3.0       # override regional Registre foncier YoY
+.venv/bin/qc-screener analyze-deal 22564119 --vacancy 4.0            # override SCHL vacancy
+.venv/bin/qc-screener analyze-deal 22564119 --rent-growth 3.0        # override SCHL rent CAGR
+.venv/bin/qc-screener analyze-deal 22564119 --expense-ratio 45       # override Lépine tiered ratio
 
 # Inspect rent comps
 .venv/bin/qc-screener rents medians --city Montréal --min-samples 5

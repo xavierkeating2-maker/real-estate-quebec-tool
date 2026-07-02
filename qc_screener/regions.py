@@ -12,7 +12,9 @@ def _strip_accents(s: str) -> str:
     )
 
 
-def _normalize_key(s: str) -> str:
+def _normalize_key(s: str | None) -> str:
+    if not isinstance(s, str) or not s:
+        return ""
     s = _strip_accents(s).lower().strip()
     s = s.replace("/", "-").replace(" ", "-")
     return re.sub(r"-+", "-", s)
