@@ -48,3 +48,23 @@ class LocationFilter:
     home_lon: float = -73.5674
     # Rayon a vol d'oiseau (km). 175 inclut Gatineau (166 km).
     max_km: float = 175.0
+
+
+@dataclass(frozen=True)
+class NotifyConfig:
+    """Config pour les notifications ntfy.sh.
+
+    Le topic doit rester prive (les topics ntfy.sh publics sont indexes).
+    Definir dans l'env: `export NTFY_TOPIC=qc-screener-xxx-random-slug`.
+    S'abonner via l'app ntfy sur mobile ou https://ntfy.sh/<topic>.
+    """
+    base_url: str = "https://ntfy.sh"
+    # Seuil de baisse (%) pour declencher une notif de drop.
+    drop_threshold_pct: float = 1.0
+    # Fenetre (jours) pour considerer un drop comme "recent".
+    drop_window_days: int = 30
+
+    @staticmethod
+    def topic_from_env() -> str | None:
+        import os
+        return os.environ.get("NTFY_TOPIC") or None

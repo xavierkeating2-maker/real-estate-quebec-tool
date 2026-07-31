@@ -56,11 +56,13 @@ def db_mtime() -> str:
 @st.cache_data(ttl=60)
 def load_listings() -> pd.DataFrame:
     conn = get_conn(str(DB_PATH))
-    rows = conn.execute("SELECT source, payload FROM listings").fetchall()
+    rows = conn.execute(
+        "SELECT source, payload, is_active, last_seen_at FROM listings"
+    ).fetchall()
     records = []
     crit = LepineCriteria()
     loc = LocationFilter()
-    for source, payload in rows:
+    for source, payload, is_active, last_seen_at in rows:
         try:
             L = Listing.model_validate_json(payload)
         except Exception:
@@ -107,8 +109,39 @@ def load_listings() -> pd.DataFrame:
             "land_share": (L.eval_land / L.municipal_evaluation)
                 if (L.eval_land and L.municipal_evaluation) else None,
             "date_posted": L.date_posted,
+            "is_active": bool(is_active) if is_active is not None else True,
+            "last_seen_at": last_seen_at,
         })
     df = pd.DataFrame(records)
+    return df
+
+
+@st.cache_data(ttl=60)
+def load_recent_drops(days: int = 30) -> pd.DataFrame:
+    """Baisses de prix sur les N derniers jours, cle = (source, source_id)."""
+    from qc_screener.storage import recent_price_drops
+    conn = get_conn(str(DB_PATH))
+    rows = recent_price_drops(conn, since_days=days, min_drop_pct=0.0, active_only=False)
+    if not rows:
+        return pd.DataFrame(columns=[
+            "source", "source_id", "previous_price", "current_price",
+            "drop_pct", "drop_abs", "current_seen",
+        ])
+    return pd.DataFrame(rows)[[
+        "source", "source_id", "previous_price", "current_price",
+        "drop_pct", "drop_abs", "current_seen",
+    ]]
+
+
+@st.cache_data(ttl=60)
+def load_price_history(source: str, source_id: str) -> pd.DataFrame:
+    from qc_screener.storage import price_history
+    conn = get_conn(str(DB_PATH))
+    rows = price_history(conn, source, source_id)
+    if not rows:
+        return pd.DataFrame(columns=["seen_at", "asking_price"])
+    df = pd.DataFrame(rows, columns=["seen_at", "asking_price"])
+    df["seen_at"] = pd.to_datetime(df["seen_at"])
     return df
 
 
@@ -169,6 +202,10 @@ with st.sidebar:
         "Inclure annonces sans coordonnées", value=False,
         help="Listings dont la latitude/longitude n'a pu être extraite.",
     )
+    include_inactive = st.checkbox(
+        "Inclure annonces retirées du marché", value=False,
+        help="Annonces soft-deletées par `qc-screener prune` (plus vues au dernier crawl --full).",
+    )
 
     st.divider()
     st.markdown(
@@ -183,11 +220,13 @@ if not db_present():
 
 
 def filter_by_distance(df: pd.DataFrame) -> pd.DataFrame:
-    """Applique le filtre de distance global de la barre latérale."""
+    """Applique les filtres globaux de la barre latérale (distance + is_active)."""
     if include_no_coords:
         mask = df["distance_km"].isna() | (df["distance_km"] <= max_km)
     else:
         mask = df["distance_km"].notna() & (df["distance_km"] <= max_km)
+    if not include_inactive and "is_active" in df.columns:
+        mask &= df["is_active"]
     return df[mask].copy()
 
 
@@ -280,11 +319,21 @@ with tab_annonces:
     view = df[mask].copy().sort_values("price_to_eval")
 
     st.caption(f"{len(view)} annonces correspondent aux filtres")
+    # Merge recent price drops (30j) — pas de match pour les annonces sans changement.
+    drops = load_recent_drops(days=30)
+    if not drops.empty:
+        view = view.merge(
+            drops[["source", "source_id", "drop_pct", "drop_abs"]],
+            on=["source", "source_id"], how="left",
+        )
+    else:
+        view["drop_pct"] = None
+        view["drop_abs"] = None
     STATUS_BADGE = {"pass": "✅ Pass", "pass_partial": "⚠️ Partiel", "fail": "❌"}
     view = view.assign(status_badge=view["status"].map(STATUS_BADGE).fillna("—"))
     cols = [
         "source", "source_id", "city", "distance_km", "units", "year_built",
-        "asking_price", "municipal_evaluation", "price_to_eval",
+        "asking_price", "drop_pct", "municipal_evaluation", "price_to_eval",
         "annual_gross_revenue", "mrb", "cf_per_door_month",
         "taxes_total", "land_share", "date_posted", "status_badge", "url",
     ]
@@ -294,6 +343,11 @@ with tab_annonces:
             "url": st.column_config.LinkColumn("URL"),
             "distance_km": st.column_config.NumberColumn("Distance (km)", format="%.0f"),
             "asking_price": st.column_config.NumberColumn("Prix", format="%.0f $"),
+            "drop_pct": st.column_config.NumberColumn(
+                "Δ prix 30j",
+                format="↓ %.1f%%",
+                help="Baisse en % vs le prix observe precedemment (30 derniers jours). Vide = pas de baisse.",
+            ),
             "municipal_evaluation": st.column_config.NumberColumn("Éval", format="%.0f $"),
             "annual_gross_revenue": st.column_config.NumberColumn("Revenus an.", format="%.0f $"),
             "price_to_eval": st.column_config.NumberColumn("Prix/éval", format="%.2f"),
@@ -497,6 +551,30 @@ with tab_analyse:
                             format_func=lambda i: choices[i])
         sid = df_idx.index[idx]
         listing_row = df_idx.iloc[idx]
+
+        # Panneau historique de prix (si >1 point observe)
+        ph = load_price_history(listing_row["source"], sid)
+        if len(ph) >= 2:
+            first_price = ph["asking_price"].iloc[0]
+            last_price = ph["asking_price"].iloc[-1]
+            delta_pct = (last_price - first_price) / first_price * 100
+            delta_abs = last_price - first_price
+            color = "🔻" if delta_abs < 0 else ("🔺" if delta_abs > 0 else "➡️")
+            with st.expander(
+                f"📉 Historique de prix — {len(ph)} observations · "
+                f"{color} {delta_pct:+.1f}% ({delta_abs:+,.0f} $) depuis la 1ère",
+                expanded=True,
+            ):
+                fig = px.line(
+                    ph, x="seen_at", y="asking_price", markers=True,
+                    labels={"seen_at": "Date", "asking_price": "Prix demandé ($)"},
+                )
+                fig.update_layout(height=250, margin=dict(l=0, r=0, t=10, b=0))
+                st.plotly_chart(fig, use_container_width=True)
+                st.dataframe(
+                    ph.assign(asking_price=ph["asking_price"].map(lambda v: f"{v:,.0f} $")),
+                    hide_index=True, use_container_width=True,
+                )
 
         # Panneau extraction LLM (si dispo)
         if pd.notna(listing_row.get("extraction_confidence")):

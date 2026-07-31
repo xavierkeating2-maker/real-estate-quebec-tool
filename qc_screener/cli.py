@@ -1,12 +1,13 @@
+from datetime import datetime, timezone
 from pathlib import Path
 
 import typer
 from rich.console import Console
 from rich.table import Table
 
-from . import centris, duproprio, kijiji, llm_extract, logisquebec, market, proprio_direct, registre_foncier, regions as regions_mod, schl, storage
+from . import centris, duproprio, kijiji, llm_extract, logisquebec, market, notify as notify_mod, proprio_direct, registre_foncier, regions as regions_mod, schl, storage
 from .analyzer import DealInputs, analyze, estimate_expense_ratio
-from .config import LepineCriteria, LocationFilter
+from .config import LepineCriteria, LocationFilter, NotifyConfig
 from .geo import haversine_km
 from .lepine import compute_metrics, screen
 from .models import Listing
@@ -28,29 +29,155 @@ console = Console()
 DEFAULT_DB = Path("data/screener.db")
 
 
+FULL_CRAWL_MAX_PAGES = 200  # sentinelle — chaque source s'arrete auto sur page vide
+
+
 @app.command()
 def crawl(
     source: str = typer.Option("all", help=f"Source: {', '.join(SOURCES)} ou 'all'"),
-    max_pages: int = typer.Option(5, help="Pages a parcourir par source"),
+    max_pages: int = typer.Option(5, help="Pages a parcourir par source (ignore si --full)"),
+    full: bool = typer.Option(
+        False, "--full",
+        help="Walk the FULL catalog (auto-stop sur page vide). Requis pour un pruning fiable.",
+    ),
     region: str = typer.Option(None, help="Filtre region (utilise par DuProprio uniquement pour l'instant)"),
     db: Path = typer.Option(DEFAULT_DB, help="Chemin de la base SQLite"),
 ) -> None:
-    """Telecharge les annonces multilogement dans la base."""
+    """Telecharge les annonces multilogement dans la base.
+
+    Chaque annonce vue est marquee `last_seen_at = now()` et `is_active = 1`.
+    Le pruning (commande separee) marquera comme retirees les annonces non
+    revues depuis N jours — pour que ce signal soit fiable, faire un
+    `crawl --full` a intervalle regulier (nightly).
+    """
     conn = storage.connect(db)
+    pages = FULL_CRAWL_MAX_PAGES if full else max_pages
     targets = list(SOURCES) if source == "all" else [source]
     for src in targets:
         if src not in SOURCES:
             console.print(f"[red]Source inconnue: {src}[/red]")
             raise typer.Exit(1)
         mod = SOURCES[src]
-        console.print(f"[bold cyan]==> {src}[/bold cyan]")
+        console.print(f"[bold cyan]==> {src}[/bold cyan]"
+                      + (f"  [dim](FULL walk, max {pages} pages)[/dim]" if full else ""))
         count = 0
-        for listing in mod.crawl_listings(max_pages=max_pages, region=region):
+        for listing in mod.crawl_listings(max_pages=pages, region=region):
             storage.upsert_listing(conn, listing)
             count += 1
             console.print(f"[green]ok[/green] {src}/{listing.source_id}  "
                           f"{(listing.title or '')[:70]}")
         console.print(f"[dim]{src}: {count} annonces stockees[/dim]")
+
+
+@app.command()
+def prune(
+    days: int = typer.Option(7, help="Marque comme retirees les annonces non revues depuis N jours."),
+    dry_run: bool = typer.Option(
+        False, "--dry-run",
+        help="Affiche ce qui serait retire sans rien modifier.",
+    ),
+    db: Path = typer.Option(DEFAULT_DB, help="Chemin de la base SQLite"),
+) -> None:
+    """Soft-delete des annonces disparues (last_seen_at < now - N jours).
+
+    Utilise le signal `last_seen_at` stampe par `crawl` (particulierement `crawl --full`).
+    Une annonce reactivee par un crawl ulterieur reprendra is_active=1 automatiquement
+    (voir storage.upsert_listing).
+
+    Garde-fou: refuse si >50% des annonces actives ont last_seen_at=NULL — signale
+    qu'aucun crawl --full n'a encore tourne apres la migration du schema.
+    """
+    from datetime import timedelta
+
+    conn = storage.connect(db)
+    total_active = conn.execute(
+        "SELECT COUNT(*) FROM listings WHERE is_active = 1"
+    ).fetchone()[0]
+    null_seen = conn.execute(
+        "SELECT COUNT(*) FROM listings WHERE is_active = 1 AND last_seen_at IS NULL"
+    ).fetchone()[0]
+
+    if total_active == 0:
+        console.print("[yellow]Aucune annonce active — rien a faire.[/yellow]")
+        raise typer.Exit(0)
+    if null_seen / total_active > 0.5:
+        console.print(
+            f"[red]Garde-fou:[/red] {null_seen}/{total_active} annonces actives n'ont "
+            f"pas de last_seen_at. Lancer `crawl --source all --full` d'abord."
+        )
+        raise typer.Exit(1)
+
+    # Garde-fou #2: le crawl lui-meme est-il recent? Si le max(last_seen_at) date
+    # d'avant la fenetre `--days`, le pruning est probablement en train de refleter
+    # un catalogue perime plutot que des annonces vraiment disparues.
+    now = datetime.now(timezone.utc)
+    latest_seen_str = conn.execute(
+        "SELECT MAX(last_seen_at) FROM listings WHERE is_active = 1"
+    ).fetchone()[0]
+    if latest_seen_str:
+        latest_seen = datetime.fromisoformat(latest_seen_str)
+        crawl_age_days = (now - latest_seen).total_seconds() / 86400
+        if crawl_age_days > days and not dry_run:
+            console.print(
+                f"[red]Garde-fou:[/red] le crawl le plus recent date d'il y a "
+                f"{crawl_age_days:.1f}j (> {days}j). Relancer `crawl --source all --full` "
+                f"avant de prune, sinon le catalogue entier serait retire.\n"
+                f"[dim]Utiliser `--dry-run` pour voir les candidats sans appliquer.[/dim]"
+            )
+            raise typer.Exit(1)
+
+    cutoff = (now - timedelta(days=days)).isoformat()
+
+    # Detail par source pour le rapport
+    per_source = conn.execute(
+        """
+        SELECT source, COUNT(*)
+        FROM listings
+        WHERE is_active = 1
+          AND (last_seen_at IS NULL OR last_seen_at < ?)
+        GROUP BY source
+        ORDER BY source
+        """,
+        (cutoff,),
+    ).fetchall()
+
+    total_to_prune = sum(n for _, n in per_source)
+
+    table = Table(title=f"Candidats prune (non vus depuis {days}j, avant {cutoff[:10]})")
+    for col in ("Source", "A retirer", "Actives avant", "Restantes"):
+        table.add_column(col, justify="right")
+    for src, n in per_source:
+        active_before = conn.execute(
+            "SELECT COUNT(*) FROM listings WHERE is_active = 1 AND source = ?", (src,)
+        ).fetchone()[0]
+        table.add_row(src, str(n), str(active_before), str(active_before - n))
+    console.print(table)
+
+    if total_to_prune == 0:
+        console.print("[green]Rien a retirer — catalogue frais.[/green]")
+        raise typer.Exit(0)
+
+    if dry_run:
+        console.print(
+            f"\n[cyan]DRY-RUN:[/cyan] {total_to_prune} annonces seraient retirees. "
+            f"Relancer sans `--dry-run` pour appliquer."
+        )
+        raise typer.Exit(0)
+
+    cur = conn.execute(
+        """
+        UPDATE listings
+        SET is_active = 0
+        WHERE is_active = 1
+          AND (last_seen_at IS NULL OR last_seen_at < ?)
+        """,
+        (cutoff,),
+    )
+    conn.commit()
+    console.print(
+        f"\n[bold green]{cur.rowcount}[/bold green] annonces marquees inactives. "
+        f"Un futur `crawl --full` les reactivera si elles reviennent."
+    )
 
 
 @app.command()
@@ -62,12 +189,17 @@ def run(
         LocationFilter().max_km,
         help="Distance max (km, vol d'oiseau) depuis la maison configuree dans config.py. 0 = pas de filtre.",
     ),
+    include_inactive: bool = typer.Option(
+        False, "--include-inactive",
+        help="Inclut les annonces soft-deletees (retirees par `prune`).",
+    ),
 ) -> None:
     """Applique les filtres Lepine; affiche les meilleures annonces (tri score desc)."""
     criteria = LepineCriteria()
     loc = LocationFilter()
     conn = storage.connect(db)
-    rows = conn.execute("SELECT payload FROM listings").fetchall()
+    where = "" if include_inactive else " WHERE is_active = 1"
+    rows = conn.execute(f"SELECT payload FROM listings{where}").fetchall()
     if not rows:
         console.print("[yellow]Aucune annonce. Faire `crawl` d'abord.[/yellow]")
         raise typer.Exit(1)
@@ -145,6 +277,10 @@ def value(
         LocationFilter().max_km,
         help="Distance max (km, vol d'oiseau) depuis la maison. 0 = pas de filtre.",
     ),
+    include_inactive: bool = typer.Option(
+        False, "--include-inactive",
+        help="Inclut les annonces soft-deletees (retirees par `prune`).",
+    ),
 ) -> None:
     """Classe les annonces par ratio prix/evaluation municipale ascendant.
 
@@ -155,7 +291,8 @@ def value(
     criteria = LepineCriteria()
     loc = LocationFilter()
     conn = storage.connect(db)
-    rows = conn.execute("SELECT payload FROM listings").fetchall()
+    where = "" if include_inactive else " WHERE is_active = 1"
+    rows = conn.execute(f"SELECT payload FROM listings{where}").fetchall()
 
     macro: dict[str, dict] = {}
     if not no_macro:
@@ -748,6 +885,210 @@ def rents_medians(
             f"{percentile(rents, 0.75):,.0f}$",
         )
     console.print(table)
+
+
+@app.command("notify")
+def notify_cmd(
+    scan: bool = typer.Option(
+        True, "--scan/--no-scan",
+        help="Balaye la DB pour les Lepine passers + baisses de prix.",
+    ),
+    topic: str = typer.Option(
+        None,
+        help="Topic ntfy.sh. Defaut: env `NTFY_TOPIC`. Non requis avec --dry-run.",
+    ),
+    dry_run: bool = typer.Option(
+        False, "--dry-run",
+        help="Affiche les notifications qui seraient envoyees sans rien pousser.",
+    ),
+    max_km: float = typer.Option(
+        LocationFilter().max_km,
+        help="Distance max (km) depuis la maison. 0 = pas de filtre.",
+    ),
+    only_full_pass: bool = typer.Option(
+        False, "--only-full-pass",
+        help="N'inclut que les status=='pass' (exclut 'pass_partial').",
+    ),
+    drop_threshold_pct: float = typer.Option(
+        NotifyConfig().drop_threshold_pct,
+        help="Seuil de baisse minimum (%) pour declencher une notif de drop.",
+    ),
+    limit: int = typer.Option(
+        0, help="Max de notifications par execution (0 = illimite). Utile au premier scan.",
+    ),
+    mark_only: bool = typer.Option(
+        False, "--mark-only",
+        help="Marque les candidats comme notifies sans envoyer. Utile pour absorber "
+             "le backlog initial et ne recevoir que les VRAIS nouveaux au prochain scan.",
+    ),
+    db: Path = typer.Option(DEFAULT_DB, help="Chemin de la base SQLite"),
+) -> None:
+    """Scanne la DB et pousse des notifications ntfy.sh pour les Lepine passers.
+
+    Deux evenements declencheurs:
+      - NEW  : annonce active passant Lepine, jamais notifiee auparavant
+      - DROP : annonce passante dont le prix demande a baisse >= seuil % vs
+               la valeur au dernier envoi
+
+    Setup une fois:
+      export NTFY_TOPIC=qc-screener-<slug-aleatoire>
+      # Abonnez-vous sur https://ntfy.sh/<topic> ou l'app mobile ntfy.
+    """
+    if not scan:
+        console.print("[yellow]Rien a faire — utiliser --scan (defaut).[/yellow]")
+        raise typer.Exit(0)
+
+    if not dry_run and not mark_only:
+        topic = topic or NotifyConfig.topic_from_env()
+        if not topic:
+            console.print(
+                "[red]Aucun topic ntfy.sh configure.[/red] "
+                "Definir `NTFY_TOPIC` dans l'env ou passer `--topic ...`.\n"
+                "[dim]Astuce: choisir un slug aleatoire, ex `qc-screener-8f3a2b1c`.[/dim]"
+            )
+            raise typer.Exit(1)
+
+    conn = storage.connect(db)
+    cfg = NotifyConfig(drop_threshold_pct=drop_threshold_pct)
+
+    # En mode mark_only ou dry_run, on scanne sans envoyer.
+    notifs = notify_mod.scan(
+        conn, notify_cfg=cfg, max_km=max_km,
+        include_partial=not only_full_pass,
+    )
+    if limit > 0:
+        notifs = notifs[:limit]
+
+    if not notifs:
+        console.print("[green]Aucune notification a envoyer (tout est deja notifie).[/green]")
+        raise typer.Exit(0)
+
+    if mark_only:
+        for n in notifs:
+            notify_mod.mark_notified(conn, n)
+        console.print(
+            f"[bold cyan]{len(notifs)}[/bold cyan] annonces marquees comme notifiees "
+            f"(sans envoi). Prochaine execution ne verra que les vrais nouveaux."
+        )
+        raise typer.Exit(0)
+
+    if not dry_run and len(notifs) > 20:
+        console.print(
+            f"[yellow]Attention:[/yellow] {len(notifs)} notifications a envoyer d'un coup. "
+            f"Pour un premier scan, considerer `--mark-only` (absorber le backlog "
+            f"sans spam) ou `--limit 5` (test).\n[dim]Continue dans 3s... Ctrl-C pour "
+            f"annuler.[/dim]"
+        )
+        import time as _t
+        _t.sleep(3)
+
+    sent: list = []
+    errors: list = []
+    if dry_run:
+        sent = notifs
+    else:
+        for i, n in enumerate(notifs):
+            if i > 0:
+                import time as _t
+                _t.sleep(0.2)
+            try:
+                notify_mod.send(n, topic=topic, base_url=cfg.base_url)
+                notify_mod.mark_notified(conn, n)
+                sent.append(n)
+            except Exception as e:
+                errors.append((n, e))
+
+    kind_emoji = {"new": "🆕", "drop": "📉"}
+    table = Table(title=f"Notifications {'a envoyer (DRY-RUN)' if dry_run else 'envoyees'}")
+    for col in ("Type", "ID", "Titre", "Corps"):
+        table.add_column(col)
+    for n in sent:
+        table.add_row(
+            f"{kind_emoji[n.kind]} {n.kind}",
+            n.listing.source_id,
+            n.title[:60],
+            n.body[:70],
+        )
+    console.print(table)
+    console.print(f"[bold green]{len(sent)}[/bold green] notifications {'affichees' if dry_run else 'envoyees'}")
+    if errors:
+        console.print(f"[red]{len(errors)} echecs:[/red]")
+        for n, e in errors[:5]:
+            console.print(f"  {n.listing.source_id}: {e}")
+
+
+@app.command("price-history")
+def price_history_cmd(
+    source_id: str = typer.Argument(..., help="ID de l'annonce"),
+    db: Path = typer.Option(DEFAULT_DB, help="Chemin de la base SQLite"),
+) -> None:
+    """Affiche la timeline des prix demandes pour une annonce."""
+    conn = storage.connect(db)
+    row = conn.execute(
+        "SELECT source, url, payload FROM listings WHERE source_id = ?", (source_id,)
+    ).fetchone()
+    if not row:
+        console.print(f"[red]Annonce {source_id} introuvable.[/red]")
+        raise typer.Exit(1)
+    src, url, _payload = row
+    history = storage.price_history(conn, src, source_id)
+    if not history:
+        console.print(f"[yellow]Aucun historique de prix pour {src}/{source_id}.[/yellow]")
+        raise typer.Exit(0)
+    table = Table(title=f"Historique prix — {src}/{source_id}")
+    for col in ("Date", "Prix demande", "Δ vs precedent"):
+        table.add_column(col, justify="right")
+    prev = None
+    for seen_at, price in history:
+        delta = ""
+        if prev is not None:
+            diff = price - prev
+            pct = diff / prev * 100
+            color = "green" if diff < 0 else ("red" if diff > 0 else "dim")
+            delta = f"[{color}]{diff:+,.0f} $ ({pct:+.1f}%)[/{color}]"
+        table.add_row(seen_at[:10], f"{price:,.0f} $", delta or "—")
+        prev = price
+    console.print(table)
+    console.print(f"[dim]{url}[/dim]")
+
+
+@app.command("price-drops")
+def price_drops_cmd(
+    days: int = typer.Option(7, help="Fenetre (jours) pour considerer une baisse recente."),
+    min_drop_pct: float = typer.Option(1.0, help="Seuil de baisse minimum (%)."),
+    include_inactive: bool = typer.Option(
+        False, "--include-inactive",
+        help="Inclut aussi les annonces soft-deletees.",
+    ),
+    db: Path = typer.Option(DEFAULT_DB, help="Chemin de la base SQLite"),
+) -> None:
+    """Liste les annonces avec une baisse de prix dans les N derniers jours."""
+    conn = storage.connect(db)
+    drops = storage.recent_price_drops(
+        conn, since_days=days, min_drop_pct=min_drop_pct,
+        active_only=not include_inactive,
+    )
+    if not drops:
+        console.print(
+            f"[green]Aucune baisse >={min_drop_pct:.1f}% dans les {days} derniers jours.[/green]"
+        )
+        raise typer.Exit(0)
+    table = Table(title=f"Baisses recentes ({days}j, seuil {min_drop_pct:.1f}%) — {len(drops)} annonces")
+    for col in ("Source", "ID", "Ancien", "Nouveau", "Δ %", "Δ $", "Date"):
+        table.add_column(col, justify="right")
+    for d in drops[:50]:
+        table.add_row(
+            d["source"],
+            d["source_id"],
+            f"{d['previous_price']:,.0f}",
+            f"{d['current_price']:,.0f}",
+            f"[green]{d['drop_pct']:.1f}%[/green]",
+            f"{d['drop_abs']:,.0f}",
+            d["current_seen"][:10],
+        )
+    console.print(table)
+    if len(drops) > 50:
+        console.print(f"[dim]…et {len(drops) - 50} de plus.[/dim]")
 
 
 @app.command()

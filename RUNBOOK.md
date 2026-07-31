@@ -21,33 +21,113 @@ After this, all commands below run from `~/projects/real-estate-quebec-tool/` wi
 
 ---
 
-## 1. Daily flow — fastest
+## Refresh protocol — cheatsheet
 
-Incremental refresh + open the UI:
+Five independent pipelines feed the tool; each has its own cadence.
 
-```bash
-cd ~/projects/real-estate-quebec-tool
-.venv/bin/qc-screener crawl --source all --max-pages 20   # ~10–20 min, search-pages always fresh + detail cache hit for already-seen listings
-.venv/bin/streamlit run streamlit_app.py                  # browser opens at http://localhost:8501
-```
+| # | Pipeline                | Command (prefix `.venv/bin/qc-screener`)                                    | Cadence                              | Wall-time |
+|---|-------------------------|-----------------------------------------------------------------------------|--------------------------------------|-----------|
+| A | Listings — quick        | `crawl --source all --max-pages 20`                                         | Daily / on demand                    | ~5 min    |
+| A′| Listings — full walk ⭐  | `crawl --source all --full`                                                 | Weekly (or nightly when automated)   | ~20 min   |
+| B | Rent comps — Kijiji     | `rents fetch --source kijiji --max-pages 15 && rents renormalize`           | Bi-weekly                            | ~1 min    |
+| B′| Rent comps — LogisQC    | `rents fetch --source logisquebec --max-listings 250 && rents renormalize`  | Monthly                              | ~12 min   |
+| C | Registre foncier        | `macro refresh`                                                             | Monthly                              | ~30 s     |
+| D | SCHL / StatCan          | `schl refresh`                                                              | Monthly (updates ~yearly, cheap)     | ~30 s     |
+| E | LLM extraction          | `extract --all`  *(requires `ANTHROPIC_API_KEY`)*                           | After every full crawl               | ~$0.10 / 100 new |
+| F | Prune stale listings ⭐  | `prune --days 7`                                                            | After every full crawl               | <1 s      |
+| G | Price history ⭐         | *(auto — populated on every `crawl`)*  · inspect with `price-drops --days 7` | Auto                            | 0 s       |
+| H | Push notifications ⭐    | `notify --scan`  *(requires `NTFY_TOPIC` env var — see §2.1)*               | After every full crawl               | ~15 s     |
 
-What this captures:
-- New listings on all three buying sources (DuProprio, ProprioDirect, Centris)
-- Will NOT detect price changes on listings already in the cache — see §5 to bust
+Details for each cadence in §1–§3 below.
 
 ---
 
-## 2. Weekly flow — rent comps + macro
-
-Once a week, refresh the inputs to the deal analyzer:
+## 1. Daily / on-demand — "what's new today?"
 
 ```bash
-.venv/bin/qc-screener rents fetch --source kijiji --max-pages 15           # ~1 min
-.venv/bin/qc-screener rents fetch --source logisquebec --max-listings 250  # ~12 min (sitemap-based)
-.venv/bin/qc-screener rents renormalize                                    # backfill canonical city names
+cd ~/projects/real-estate-quebec-tool
+.venv/bin/qc-screener crawl --source all --max-pages 20   # pipeline A
+.venv/bin/streamlit run streamlit_app.py                  # browser opens at http://localhost:8501
 ```
 
-Cohort medians should refresh — verify:
+Catches new listings surfacing at the top of each portal. Does NOT catch price changes on already-cached listings (see §6 to bust) and does NOT produce a reliable pruning signal (§2 is required for that).
+
+---
+
+## 2. Weekly — full walk + rent comps + LLM extraction
+
+Run once a week (or wire into launchd once Step 6 of the automation lands):
+
+```bash
+.venv/bin/qc-screener crawl --source all --full           # pipeline A′: walks every page, auto-stops on empty
+.venv/bin/qc-screener prune --days 7                      # pipeline F: soft-delete listings not seen in 7 days
+.venv/bin/qc-screener rents fetch --source kijiji --max-pages 15
+.venv/bin/qc-screener rents renormalize                   # pipeline B: fresh rent cohorts
+.venv/bin/qc-screener extract --all                       # pipeline E: fill per-unit rents on new listings
+.venv/bin/qc-screener notify --scan                       # pipeline H: push new Lépine passers + price drops
+```
+
+Why `--full` matters:
+- Every listing seen is stamped `last_seen_at = now()`. Anything NOT seen becomes prune-eligible (`prune` will flip `is_active = 0`).
+- Ceiling is `FULL_CRAWL_MAX_PAGES = 200`, but each source stops early on the first empty results page — no runaway.
+- `--max-pages 20` was walking only ~20 % of Centris; the full walk brings the DB to full coverage (~4,500 listings vs. 861 previously).
+
+Price-history notes:
+- **Populated automatically** — every `crawl` compares the incoming `asking_price` against the last observation in `price_history` (per source_id). Only inserts a new row when the price actually changed. No config needed.
+- **Baseline seed** — on schema migration, one row per existing listing is inserted with `seen_at = fetched_at`. So drops become detectable immediately, not just after two crawls.
+- **Inspect:** `qc-screener price-history <source_id>` shows the timeline; `qc-screener price-drops --days 7` lists recent drops sorted by biggest % first.
+- **Streamlit:** the Annonces tab has a "Δ prix 30j" column (empty for stable prices); the Analyseur tab shows a mini line-chart when a listing has ≥2 price points.
+
+### 2.1 Notification setup (one-time, then automatic)
+
+`notify --scan` pushes to your phone/browser via [ntfy.sh](https://ntfy.sh) — free, no signup, no app-store account needed.
+
+**One-time setup:**
+
+1. Pick a private topic slug (must be hard to guess — ntfy.sh topics are public):
+   ```bash
+   echo "export NTFY_TOPIC=qc-screener-$(openssl rand -hex 6)" >> ~/.zshrc
+   source ~/.zshrc
+   ```
+2. Subscribe on your phone: install the **ntfy** app (iOS / Android), tap `+`, paste your topic slug. OR just open `https://ntfy.sh/<your-topic>` in a browser tab.
+3. Absorb the current backlog (one-time — otherwise the first real scan floods you with ~50 existing Lépine passers):
+   ```bash
+   .venv/bin/qc-screener notify --mark-only
+   ```
+   This marks every current passer as `notified_at = now()` without sending anything. From now on you only get pings for genuinely new listings and price drops.
+
+**Verify it works before automating:**
+
+```bash
+.venv/bin/qc-screener notify --dry-run                    # preview candidates (no send)
+.venv/bin/qc-screener notify --dry-run --limit 3          # narrow preview
+.venv/bin/qc-screener notify --scan --limit 1             # send one real ping to your phone
+```
+
+**Notification triggers:**
+- **NEW** — active listing passing Lépine that has never been notified (`notified_at IS NULL`). Sent at default priority.
+- **DROP** — Lépine passer whose `asking_price < last_price_notified` by ≥ `--drop-threshold-pct` (default 1 %). Sent at **high** priority when drop ≥ 5 %.
+
+**Gates:**
+- `notified_at` (set on first send, never cleared) suppresses re-notification of existing passers.
+- `last_price_notified` (updated on each send) is the reference for future drop detection.
+- Resurrection of a soft-deleted listing does NOT re-notify — the gates stay set.
+
+**Common flags:**
+- `--only-full-pass` — skip `pass_partial` (revenue undisclosed), notify only on `pass`
+- `--limit N` — cap number of notifications per invocation (safety valve)
+- `--max-km N` — override the default radius from `LocationFilter`
+- `--drop-threshold-pct 2.5` — only notify drops ≥ 2.5 %
+
+Pruning notes:
+- Order matters: **prune must run after `--full`**, otherwise a partial crawl would prune everything Centris didn't cover.
+- Soft-delete only: `is_active = 0`. A future `crawl --full` automatically resurrects a listing that returns.
+- Safeguard: `prune` refuses if >50 % of active rows have `last_seen_at = NULL` (signals no full-crawl has run yet after the schema migration).
+- Preview first with `prune --dry-run` before applying, especially the first time.
+- CLI screener (`run`, `value`) already excludes pruned listings; add `--include-inactive` to include them.
+- Streamlit hides pruned listings by default; toggle **"Inclure annonces retirées du marché"** in the sidebar to include them.
+
+Verify cohort medians shifted:
 
 ```bash
 .venv/bin/qc-screener rents medians --min-samples 5
@@ -55,23 +135,23 @@ Cohort medians should refresh — verify:
 
 ---
 
-## 3. Monthly flow — macro signals
+## 3. Monthly — macro inputs to the analyzer
 
-Two datasets refresh at different cadences:
-
-**Registre foncier (CC-BY, Données Québec — ~monthly):**
 ```bash
-.venv/bin/qc-screener macro refresh --force
+.venv/bin/qc-screener macro refresh                                                # pipeline C
+.venv/bin/qc-screener schl refresh                                                 # pipeline D
+.venv/bin/qc-screener rents fetch --source logisquebec --max-listings 250          # pipeline B′
+.venv/bin/qc-screener rents renormalize
+
+# sanity checks
 .venv/bin/qc-screener macro regions --months 12
+.venv/bin/qc-screener schl lookup Montréal
 ```
 
-**SCHL/StatCan (annually ~March; safe to refresh monthly):**
-```bash
-.venv/bin/qc-screener schl refresh                  # ~5 s per table
-.venv/bin/qc-screener schl lookup Montréal          # verify a lookup
-```
-
-The analyzer reads BOTH: Registre foncier gives per-region appreciation, SCHL gives per-city vacancy and rent-growth CAGR.
+Where each feeds the analyzer:
+- **Registre foncier** → per-region appreciation default in `analyze-deal` + `value --top` macro scoring
+- **SCHL** → per-city vacancy + 3-year rent-growth CAGR defaults in `analyze-deal`
+- **LogisQuébec** → rent comps for cities Kijiji covers poorly (Saguenay, Rimouski, small-town Estrie)
 
 ---
 
@@ -131,6 +211,12 @@ max_km   = 175.0      # haversine (straight-line); 175 km ≈ Gatineau
 .venv/bin/qc-screener analyze-deal 22564119 --rent-growth 3.0        # override SCHL rent CAGR
 .venv/bin/qc-screener analyze-deal 22564119 --expense-ratio 45       # override Lépine tiered ratio
 
+# Price history + recent drops
+.venv/bin/qc-screener price-history 22564119                          # timeline of a listing's asking prices
+.venv/bin/qc-screener price-drops --days 7 --min-drop-pct 1           # every drop >=1% in last 7 days
+.venv/bin/qc-screener price-drops --days 30                           # widen window
+.venv/bin/qc-screener price-drops --days 7 --include-inactive         # include soft-deleted listings
+
 # Inspect rent comps
 .venv/bin/qc-screener rents medians --city Montréal --min-samples 5
 
@@ -152,23 +238,27 @@ export ANTHROPIC_API_KEY=sk-ant-...                                  # set once 
 
 ## 6. Cache management
 
-Caches are URL-hashed files under `data/cache/<source>/`. No TTL — they persist until explicitly removed.
+Caches are URL-hashed files under `data/cache/<source>/`. **No TTL** — they persist until explicitly removed. This means a `crawl` re-uses the cached HTML instead of re-fetching, so **price changes on already-seen listings are invisible until you bust the cache.**
+
+Nuking cache files does NOT touch the SQLite DB. The next crawl re-parses the fresh HTML and upserts back into `listings` (preserving `notified_at` per §5 of storage.py).
 
 ### Bust everything (force full re-fetch on next crawl)
 
 ```bash
 rm -rf data/cache/*/
-.venv/bin/qc-screener crawl --source all --max-pages 20   # will re-fetch from scratch
+.venv/bin/qc-screener crawl --source all --full           # ~20 min — re-fetches every page + every listing
 ```
+
+Pair with `--full` (not `--max-pages 20`): if you're paying the cost of nuking the cache, you want a full walk so every listing gets fresh data AND `last_seen_at` gets stamped.
 
 ### Bust one source
 
 ```bash
 rm -rf data/cache/duproprio/
-.venv/bin/qc-screener crawl --source duproprio --max-pages 15
+.venv/bin/qc-screener crawl --source duproprio --full
 ```
 
-### Bust one listing (for price-change check)
+### Bust one listing (targeted — for price-change check on a specific ID)
 
 ```bash
 .venv/bin/python -c "
@@ -177,8 +267,10 @@ url = 'https://duproprio.com/...full-url-here...'
 print(hashlib.sha1(url.encode()).hexdigest()[:16])
 "
 rm data/cache/duproprio/<that-hash>.html
-.venv/bin/qc-screener crawl --source duproprio --max-pages 1
+.venv/bin/qc-screener crawl --source duproprio --max-pages 1   # search page 1 will re-fetch the listing detail
 ```
+
+Note: this only works if the listing is still on page 1 of the search results. If it has scrolled off, run `crawl --source duproprio --full` after the `rm` instead.
 
 ---
 
@@ -206,10 +298,10 @@ Source modules: `qc_screener/{duproprio,proprio_direct,centris,kijiji,logisquebe
 | Tab                  | What it shows                                                   |
 |----------------------|-----------------------------------------------------------------|
 | 🏠 Aperçu            | Catalog totals (in-radius), top-5 by prix/éval and MRB          |
-| 🔍 Annonces          | Filterable table (source, units, price, distance), Lépine badge |
+| 🔍 Annonces          | Filterable table (source, units, price, distance), Lépine badge, Δ prix 30j |
 | 🗺️ Carte             | OpenStreetMap with all geolocated listings, colorable by metric |
 | 💎 Aubaines          | Scatter prix/éval × MRB, Lépine sweet-spot shaded               |
-| 📊 Analyseur de deal | Pick a listing, slide offer/financing/unit-mix → live projection|
+| 📊 Analyseur de deal | Pick a listing, slide offer/financing/unit-mix → live projection; mini price-history chart when ≥2 observations |
 | 🏘️ Loyers            | Cohort medians + box-plots                                      |
 | 📡 Signal régional   | Registre foncier: ratio distress + YoY transfers per region     |
 | 📖 Méthode           | Lépine vocabulary explainer (for the sister)                    |
@@ -243,3 +335,80 @@ Checklist (so the new source plugs into everything cleanly):
 4. Add a row to the **Sources & cadence** table above.
 5. Update the **Daily flow** example if cadence needs adjusting.
 6. If it's a NEW *kind* of data (e.g. rent comps from a new portal), also register under `RENT_SOURCES` and expose via `rents fetch --source <name>`.
+
+---
+
+## 11. Automated nightly job (launchd)
+
+Runs the weekly full-refresh sequence (§2) every night at 03:00 without you touching anything. Sends an ntfy.sh push if any step fails.
+
+### One-time install
+
+```bash
+# 1. Create the secrets file (launchd doesn't source ~/.zshrc)
+cat > ~/.qc-screener.env <<'EOF'
+export NTFY_TOPIC=qc-screener-<your-random-slug>
+export ANTHROPIC_API_KEY=sk-ant-...
+EOF
+chmod 600 ~/.qc-screener.env
+
+# 2. Install the launchd agent
+./scripts/install-launchd.sh
+```
+
+The installer copies `scripts/com.qc-screener.nightly.plist.template` to `~/Library/LaunchAgents/com.qc-screener.nightly.plist`, substituting the project path, then `launchctl load`s it. It refuses to install if `.venv/bin/qc-screener` is missing or `~/.qc-screener.env` doesn't exist.
+
+### What it runs (in `scripts/nightly.sh`)
+
+```
+crawl --source all --full   # ~20 min
+prune --days 7              # <1 s
+extract --all               # ~15 s + LLM cost
+notify --scan               # ~15 s
+```
+
+Each step runs independently — a failed `crawl` doesn't skip `notify` (the notify step works on the last-known DB state, and silent failure is worse than a slightly stale notification). Overall exit code = failure count.
+
+### Verify + test-run
+
+```bash
+# Confirm launchd registered it
+launchctl list | grep qc-screener
+
+# Fire it manually right now (does NOT wait for 03:00)
+launchctl start com.qc-screener.nightly
+
+# Watch the log
+tail -f data/logs/nightly-$(date +%Y-%m-%d).log
+```
+
+### Failure notification
+
+If any step fails AND `NTFY_TOPIC` is set, the runner pushes a **high-priority** ntfy notification titled *"qc-screener nightly failed"* listing which steps errored and where the log is. You'll know immediately even if you're not watching.
+
+### Log rotation
+
+`nightly.sh` deletes `data/logs/nightly-*.log` files older than 30 days on each run. `launchd-stdout.log` and `launchd-stderr.log` (launchd's own capture) are append-only and NOT rotated — truncate them manually if they grow (they should stay tiny — everything real goes to the dated log).
+
+### Missed runs (laptop asleep at 03:00)
+
+launchd's `StartCalendarInterval` fires at the next wake-up if the Mac was asleep at the scheduled time. Only one catch-up run happens even if you missed several days. Each step is idempotent so this is safe.
+
+### Disable / uninstall
+
+```bash
+./scripts/uninstall-launchd.sh     # unload + remove plist; keeps ~/.qc-screener.env and logs
+
+# Or temporarily pause without removing:
+launchctl unload ~/Library/LaunchAgents/com.qc-screener.nightly.plist
+# Resume:
+launchctl load ~/Library/LaunchAgents/com.qc-screener.nightly.plist
+```
+
+### Not automated (still manual — see §3)
+
+The nightly job intentionally omits weekly/monthly data pipelines:
+- `rents fetch --source kijiji` / `rents fetch --source logisquebec` — rent comps
+- `macro refresh` / `schl refresh` — Registre foncier + StatCan
+
+These change slowly enough that a nightly run would be wasted requests. If you want them automated too, add a second launchd plist with `StartCalendarInterval` set to a specific day/hour (e.g. `Weekday: 0` for Sunday, `Day: 1` for monthly on the 1st).

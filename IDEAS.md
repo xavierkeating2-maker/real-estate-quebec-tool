@@ -9,11 +9,37 @@ Each entry: a *filed date* (when the idea came up) and, if pursued, a *done date
 ## 🔲 To do
 
 
-### Automate new data fetches and notify for Lépiner passers
+### Automate new data fetches and notify for Lépiner passers *(filed 2026-07-02, done 2026-07-31)*
+
+All 6 steps shipped: schema (is_active/last_seen_at/notified_at/last_price_notified + price_history table), `crawl --full`, `prune`, price-history/drop-detection, `notify --scan` (ntfy.sh push for NEW passers + DROP events), and launchd nightly wiring. See individual entries for details on each step.
+
+### Step 6 — launchd nightly wiring *(filed 2026-07-31, done 2026-07-31)*
+
+Shipped `scripts/nightly.sh` + `scripts/com.qc-screener.nightly.plist.template` + `scripts/install-launchd.sh` + `scripts/uninstall-launchd.sh` + RUNBOOK §11. Nightly at 03:00 runs `crawl --full && prune --days 7 && extract --all && notify --scan`, continuing past step failures so a broken crawl doesn't silence the notify. Secrets sourced from `~/.qc-screener.env` (installer refuses if missing). Logs to `data/logs/nightly-YYYY-MM-DD.log` with 30-day rotation. Failure notification pushed via ntfy.sh (high priority) using the existing `NTFY_TOPIC`. Missed runs (Mac asleep at 03:00) catch up on next wake — safe because every step is idempotent.
+
+**Still to verify manually (blockers to actually running the nightly):**
+- User has not yet created `~/.qc-screener.env` with `NTFY_TOPIC` + `ANTHROPIC_API_KEY`.
+- User has not yet subscribed to their ntfy topic on phone / browser.
+- User has not yet sent a real test-ping (`notify --scan --limit 1`) to confirm the ntfy pipe works end-to-end.
+- User has not yet run `./scripts/install-launchd.sh` or `launchctl start com.qc-screener.nightly` to confirm the launchd wiring actually fires.
+
+**Deferred (not blocked by anything, filed as new work):** weekly `rents fetch` and monthly `macro refresh` + `schl refresh` remain manual. Adding a second launchd plist with `Weekday: 0` (Sunday) / `Day: 1` (monthly) would automate them. Left out of the initial cut because they change slowly and a nightly run would waste requests.
 
 
-### Automate deletion of sold or no-longer-available listings
 
+### ntfy.sh push notifications *(filed 2026-07-02, done 2026-07-31)*
+
+New `qc_screener/notify.py` module + `NotifyConfig` in `config.py` + `notify` CLI command. Reads topic from `NTFY_TOPIC` env var (private-by-obscurity — ntfy.sh topics are public). Two event kinds: NEW (`notified_at IS NULL` + passes Lépine) and DROP (asking_price < last_price_notified × (1 - threshold)). Priority auto-elevated to `high` when drop ≥ 5 %. Backlog absorption via `--mark-only` flag (marks candidates as notified without sending). Safety features: `--dry-run`, `--limit N`, warning + 3s pause when about to send > 20 notifications. Gates persist in `listings.notified_at` and `listings.last_price_notified` so soft-delete + resurrection doesn't re-notify. Uses httpx.Client with 0.2 s throttle between sends (well under ntfy.sh's 5 msg/sec limit).
+
+### Price history + drop detection *(filed 2026-07-02, done 2026-07-31)*
+
+New `price_history` table (source, source_id, seen_at, asking_price). Auto-populated by `storage.upsert_listing` on every crawl — only inserts when the incoming price differs from the last observation. One-shot seed on migration inserts current price of every existing listing with `seen_at = fetched_at`, so the 4,555 pre-existing priced listings have an immediate baseline. New CLI: `qc-screener price-history <source_id>` (timeline table) and `qc-screener price-drops --days N --min-drop-pct X` (recent drops ranked by biggest %). Streamlit: `Δ prix 30j` column in Annonces tab + mini line chart in Analyseur when ≥2 observations. The `recent_price_drops` SQL uses LAG() window functions to compare each observation vs its predecessor efficiently.
+
+### Automate deletion of sold or no-longer-available listings *(filed 2026-07-02, partial 2026-07-30)*
+
+Storage layer + pruner shipped. `listings` gained `is_active` + `last_seen_at`; `crawl` (esp. `--full`) stamps `last_seen_at` on every seen listing; new `qc-screener prune --days 7` soft-deletes actives whose `last_seen_at` is stale, with two safeguards (refuses if >50 % of actives have NULL `last_seen_at`, or if the most recent crawl itself is older than the window). CLI screener (`run`, `value`) excludes pruned rows by default (`--include-inactive` to include); Streamlit hides them by default (sidebar toggle). Resurrection is automatic — a listing reappearing in a later `crawl --full` flips back to `is_active = 1`. Still to do: launchd nightly wiring (Step 6) so this runs untouched.
+
+### Personal Tax Considerations (ex. mortgage payment deductions)
 
 
 ### High-value data we already have but haven't parsed

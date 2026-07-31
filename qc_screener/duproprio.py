@@ -61,6 +61,7 @@ def search_listings(max_pages: int = 1, region: str | None = None) -> list[str]:
             page_url += f"{sep}regions={region}"
         html = fetch(page_url)
         tree = HTMLParser(html)
+        page_urls: list[str] = []
         for li in tree.css("li.search-results-listings-list__item"):
             a = li.css_first('a[property="significantLink"]')
             if a is None:
@@ -73,7 +74,10 @@ def search_listings(max_pages: int = 1, region: str | None = None) -> list[str]:
             # Ignore les fiches "vendu" (annonces de temoignages reaffichees).
             if "-vendu-" in href:
                 continue
-            urls.append(href if href.startswith("http") else BASE + href)
+            page_urls.append(href if href.startswith("http") else BASE + href)
+        if not page_urls:
+            break  # fin des resultats — evite de continuer sur des pages vides
+        urls.extend(page_urls)
     return list(dict.fromkeys(urls))
 
 
