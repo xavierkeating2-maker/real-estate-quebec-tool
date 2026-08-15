@@ -160,24 +160,28 @@ def scan(
     return notifications
 
 
+# ntfy: les priorites nommees ne sont valides qu'en header; l'API JSON attend
+# un entier 1-5. On passe par le JSON pour supporter l'UTF-8 (accents + emoji)
+# dans le titre, qu'un header HTTP (latin-1 uniquement) ne peut pas transporter.
+_PRIORITY_TO_INT = {"min": 1, "low": 2, "default": 3, "high": 4, "urgent": 5}
+
+
 def send(
     notif: Notification, topic: str, base_url: str = "https://ntfy.sh",
     client: httpx.Client | None = None,
 ) -> None:
-    """Envoie via ntfy.sh (POST plein-corps + headers). Leve en cas d'echec."""
+    """Envoie via l'API JSON de ntfy.sh (UTF-8 natif). Leve en cas d'echec."""
     _client = client or httpx.Client(timeout=15)
     try:
-        headers = {
-            "Title": notif.title,
-            "Priority": notif.priority,
-            "Tags": ",".join(notif.tags),
-            "Click": notif.click_url,
+        payload = {
+            "topic": topic,
+            "title": notif.title,
+            "message": notif.body,
+            "priority": _PRIORITY_TO_INT.get(notif.priority, 3),
+            "tags": notif.tags,
+            "click": notif.click_url,
         }
-        r = _client.post(
-            f"{base_url}/{topic}",
-            content=notif.body.encode("utf-8"),
-            headers=headers,
-        )
+        r = _client.post(base_url, json=payload)
         r.raise_for_status()
     finally:
         if client is None:

@@ -13,17 +13,23 @@ Each entry: a *filed date* (when the idea came up) and, if pursued, a *done date
 
 All 6 steps shipped: schema (is_active/last_seen_at/notified_at/last_price_notified + price_history table), `crawl --full`, `prune`, price-history/drop-detection, `notify --scan` (ntfy.sh push for NEW passers + DROP events), and launchd nightly wiring. See individual entries for details on each step.
 
-### Step 6 — launchd nightly wiring *(filed 2026-07-31, done 2026-07-31)*
+### Step 6 — launchd nightly wiring *(filed 2026-07-31, code done 2026-07-31, setup in-progress 2026-08-14)*
 
 Shipped `scripts/nightly.sh` + `scripts/com.qc-screener.nightly.plist.template` + `scripts/install-launchd.sh` + `scripts/uninstall-launchd.sh` + RUNBOOK §11. Nightly at 03:00 runs `crawl --full && prune --days 7 && extract --all && notify --scan`, continuing past step failures so a broken crawl doesn't silence the notify. Secrets sourced from `~/.qc-screener.env` (installer refuses if missing). Logs to `data/logs/nightly-YYYY-MM-DD.log` with 30-day rotation. Failure notification pushed via ntfy.sh (high priority) using the existing `NTFY_TOPIC`. Missed runs (Mac asleep at 03:00) catch up on next wake — safe because every step is idempotent.
 
-**Still to verify manually (blockers to actually running the nightly):**
-- User has not yet created `~/.qc-screener.env` with `NTFY_TOPIC` + `ANTHROPIC_API_KEY`.
-- User has not yet subscribed to their ntfy topic on phone / browser.
-- User has not yet sent a real test-ping (`notify --scan --limit 1`) to confirm the ntfy pipe works end-to-end.
-- User has not yet run `./scripts/install-launchd.sh` or `launchctl start com.qc-screener.nightly` to confirm the launchd wiring actually fires.
+**Setup checklist — resume here (state as of 2026-08-15):**
+- [x] **A. Pick + subscribe to ntfy topic** — DONE. Old compromised slug replaced with a fresh `openssl rand -hex 8` value `qc-screener-c884763f6e3cd6c6`; user re-subscribed on the ntfy phone app.
+- [x] **B. Save secrets to `~/.qc-screener.env`** — topic written + `chmod 600`. ⚠️ **`ANTHROPIC_API_KEY` still missing** — user has no key yet; must create one at console.anthropic.com (API billing is separate from the Claude Code subscription). Needed only by the `extract` step, so notifications work without it, but the nightly's extract will fail until it's added.
+- [x] **C. Test-send one real notification** — DONE, user confirmed both pings landed on the phone. **Uncovered + fixed a bug:** `notify.send()` put the title/tags in HTTP headers, which are latin-1-only, so any accent (Lépine, éval) or emoji (✅⚠️📉) raised `'ascii' codec can't encode`. Rewrote `send()` to use ntfy's JSON publishing API (UTF-8 native); priority now mapped string→int via `_PRIORITY_TO_INT`. One backlog listing was consumed by this test (marked notified).
+- [x] **D. Absorb the backlog silently.** DONE — `notify --mark-only` marked the remaining 54 active Lépine passers as notified without sending. Future nightly runs now only fire on genuinely new listings + price drops.
+- [ ] **E. Install the launchd agent.** `./scripts/install-launchd.sh` (only *warns* if `~/.qc-screener.env` lacks a key — doesn't refuse). Then `launchctl list | grep qc-screener` to verify. Best done after the API key is in place so the nightly extract step doesn't fail.
+- [ ] **F. Test-fire the nightly manually.** `launchctl start com.qc-screener.nightly && tail -f data/logs/nightly-$(date +%Y-%m-%d).log`. This actually runs the full ~20 min pipeline — do it when you have time to watch.
 
 **Deferred (not blocked by anything, filed as new work):** weekly `rents fetch` and monthly `macro refresh` + `schl refresh` remain manual. Adding a second launchd plist with `Weekday: 0` (Sunday) / `Day: 1` (monthly) would automate them. Left out of the initial cut because they change slowly and a nightly run would waste requests.
+
+### Detect sold / off-market listings *(filed 2026-08-15)*
+
+Surfaced during notify setup: the sainte-marguerite-du-lac listing was still active + Lépine-passing in the DB but is **sold** in reality. `prune --days 7` only removes listings no longer *seen* in the crawl — a listing that stays published with a "sold/vendu" badge keeps passing and could trigger a notification. Idea: parse a sold/conditional-sale status from each source's detail page and either skip it in `screen()`/`scan()` or add a `status` field to `Listing` and gate notifications on it. Needs per-source markup inspection (Centris, DuProprio, ProprioDirect). Low volume but high annoyance — a push about a dead deal erodes trust in the pipe.
 
 
 
