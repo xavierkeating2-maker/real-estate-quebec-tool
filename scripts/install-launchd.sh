@@ -49,8 +49,11 @@ sed "s|__PROJECT_DIR__|$PROJECT_DIR|g" "$PLIST_SRC" > "$PLIST_DST"
 launchctl unload "$PLIST_DST" 2>/dev/null || true
 launchctl load "$PLIST_DST"
 
-# Confirm it's registered.
-if launchctl list | grep -q "$LABEL"; then
+# Confirm it's registered. Query the label directly rather than piping
+# `launchctl list` into `grep -q`: grep exits on first match, launchctl then
+# takes SIGPIPE (exit 141), and `set -o pipefail` would turn that successful
+# match into a pipeline failure -> false FATAL.
+if launchctl list "$LABEL" >/dev/null 2>&1; then
     echo "OK  Installed $LABEL"
     echo "    Schedule: nightly 03:00 (catches up on next wake if Mac was asleep)"
     echo "    Plist:    $PLIST_DST"
