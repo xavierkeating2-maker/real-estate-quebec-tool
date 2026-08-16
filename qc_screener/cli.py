@@ -53,6 +53,7 @@ def crawl(
     conn = storage.connect(db)
     pages = FULL_CRAWL_MAX_PAGES if full else max_pages
     targets = list(SOURCES) if source == "all" else [source]
+    failed_sources: list[str] = []
     for src in targets:
         if src not in SOURCES:
             console.print(f"[red]Source inconnue: {src}[/red]")
@@ -61,12 +62,23 @@ def crawl(
         console.print(f"[bold cyan]==> {src}[/bold cyan]"
                       + (f"  [dim](FULL walk, max {pages} pages)[/dim]" if full else ""))
         count = 0
-        for listing in mod.crawl_listings(max_pages=pages, region=region):
-            storage.upsert_listing(conn, listing)
-            count += 1
-            console.print(f"[green]ok[/green] {src}/{listing.source_id}  "
-                          f"{(listing.title or '')[:70]}")
+        # Une source qui echoue (timeout reseau, etc.) ne doit pas empecher les
+        # autres de crawler. Les annonces deja upsertees avant l'echec restent.
+        try:
+            for listing in mod.crawl_listings(max_pages=pages, region=region):
+                storage.upsert_listing(conn, listing)
+                count += 1
+                console.print(f"[green]ok[/green] {src}/{listing.source_id}  "
+                              f"{(listing.title or '')[:70]}")
+        except Exception as e:
+            console.print(f"[red]{src}: crawl interrompu apres {count} annonces: {e}[/red]")
+            failed_sources.append(src)
         console.print(f"[dim]{src}: {count} annonces stockees[/dim]")
+    # Sortie non-zero si au moins une source a echoue: le nightly marque l'etape
+    # FAILED (honnete sur l'echec partiel) tout en ayant crawle les autres sources.
+    if failed_sources:
+        console.print(f"[red]Sources en echec: {', '.join(failed_sources)}[/red]")
+        raise typer.Exit(1)
 
 
 @app.command()
@@ -426,23 +438,25 @@ def extract(
 
     ok = err = 0
     for src, sid, data, desc in targets:
+        # apply_to_listing + persist restent dans le try: une annonce malformee
+        # coute une annonce, pas le batch entier (cf. crash float(None) 2026-08-15).
         try:
             extracted = llm_extract.extract(desc, units_hint=data.get("units"), client=client,
                                             use_cache=not refresh)
+            if not extracted:
+                console.print(f"[yellow]vide[/yellow] {src}/{sid}")
+                err += 1
+                continue
+            merged = llm_extract.apply_to_listing(data, extracted)
+            conn.execute(
+                "UPDATE listings SET payload=? WHERE source=? AND source_id=?",
+                (json_mod.dumps(merged), src, sid),
+            )
+            conn.commit()
         except Exception as e:
             console.print(f"[red]echec[/red] {src}/{sid}: {e}")
             err += 1
             continue
-        if not extracted:
-            console.print(f"[yellow]vide[/yellow] {src}/{sid}")
-            err += 1
-            continue
-        merged = llm_extract.apply_to_listing(data, extracted)
-        conn.execute(
-            "UPDATE listings SET payload=? WHERE source=? AND source_id=?",
-            (json_mod.dumps(merged), src, sid),
-        )
-        conn.commit()
         rents = extracted.get("per_unit_rents") or []
         reno = len(extracted.get("renovations_done") or [])
         pot = extracted.get("rent_reset_potential") or "?"

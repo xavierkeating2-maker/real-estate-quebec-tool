@@ -117,7 +117,12 @@ def extract(description: str, units_hint: int | None = None,
 
 def apply_to_listing(listing_payload: dict, extracted: dict) -> dict:
     """Fusionne les champs extraits dans le payload Listing JSON."""
-    listing_payload["per_unit_rents"] = [float(r) for r in extracted.get("per_unit_rents") or []]
+    # Le LLM peut renvoyer None pour un loyer inconnu (ex: [1200, None, 1400]).
+    # On les ecarte: un loyer manquant sous-estime le brut, donc l'annonce ne
+    # peut que moins bien passer Lepine — jamais mieux (echec conservateur).
+    listing_payload["per_unit_rents"] = [
+        float(r) for r in (extracted.get("per_unit_rents") or []) if r is not None
+    ]
     listing_payload["per_unit_sizes"] = list(extracted.get("per_unit_sizes") or [])
     listing_payload["renovations_done"] = list(extracted.get("renovations_done") or [])
     listing_payload["renovations_needed"] = list(extracted.get("renovations_needed") or [])
