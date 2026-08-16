@@ -23,13 +23,21 @@ Shipped `scripts/nightly.sh` + `scripts/com.qc-screener.nightly.plist.template` 
 - [x] **C. Test-send one real notification** — DONE, user confirmed both pings landed on the phone. **Uncovered + fixed a bug:** `notify.send()` put the title/tags in HTTP headers, which are latin-1-only, so any accent (Lépine, éval) or emoji (✅⚠️📉) raised `'ascii' codec can't encode`. Rewrote `send()` to use ntfy's JSON publishing API (UTF-8 native); priority now mapped string→int via `_PRIORITY_TO_INT`. One backlog listing was consumed by this test (marked notified).
 - [x] **D. Absorb the backlog silently.** DONE — `notify --mark-only` marked the remaining 54 active Lépine passers as notified without sending. Future nightly runs now only fire on genuinely new listings + price drops.
 - [x] **E. Install the launchd agent.** DONE — `com.qc-screener.nightly` loaded (verified via `launchctl print`: correct program, working dir, log paths; scheduled 03:00). API key confirmed valid + billing active (HTTP 200 on a minimal messages call) before install. **Fixed a real installer bug found on this first-ever run:** the registration self-check piped `launchctl list` into `grep -q`, whose early-exit gave `launchctl` a SIGPIPE (exit 141), and `set -o pipefail` turned a *successful* match into a FATAL. Now queries the label directly (`launchctl list "$LABEL"`) — no pipe.
-- [ ] **F. Test-fire the nightly manually.** `launchctl start com.qc-screener.nightly && tail -f data/logs/nightly-$(date +%Y-%m-%d).log`. This actually runs the full ~20 min pipeline — do it when you have time to watch.
+- [~] **F. Test-fire the nightly manually** — FIRED 2026-08-15 18:28. Ran end-to-end and **surfaced 2 real bugs, both now fixed + committed** (`0de3237`):
+  - **extract crashed the whole batch on `float(None)`** — LLM returned `[1535, None]` for `per_unit_rents`; `apply_to_listing` was outside the loop's try/except so one bad listing aborted the run. Fixed (drop None + widen try). Validated on the exact cached crashing input → `[1535.0]`, no crash.
+  - **crawl aborted all sources on one `ReadTimeout`.** Fixed (per-source try/except, still exits non-zero on partial failure).
+  - Also observed: ~292 `Connection error` skips during extract = **overnight network outage (Mac likely asleep)**, not a code bug — the loop correctly skipped them. Notify worked perfectly: 4 real notifications delivered (1 drop + 3 new passers, accents/emoji intact) — the real-path proof of the ntfy JSON fix.
+  - **Remaining:** ~1147 listings still unextracted (the outage + the crash left the batch undrained). Fix is committed, so tonight's 03:00 run will drain them without crashing (network permitting). Final F sign-off = first clean scheduled run — check `nightly-2026-08-17.log`.
 
 **Deferred (not blocked by anything, filed as new work):** weekly `rents fetch` and monthly `macro refresh` + `schl refresh` remain manual. Adding a second launchd plist with `Weekday: 0` (Sunday) / `Day: 1` (monthly) would automate them. Left out of the initial cut because they change slowly and a nightly run would waste requests.
 
 ### Detect sold / off-market listings *(filed 2026-08-15)*
 
 Surfaced during notify setup: the sainte-marguerite-du-lac listing was still active + Lépine-passing in the DB but is **sold** in reality. `prune --days 7` only removes listings no longer *seen* in the crawl — a listing that stays published with a "sold/vendu" badge keeps passing and could trigger a notification. Idea: parse a sold/conditional-sale status from each source's detail page and either skip it in `screen()`/`scan()` or add a `status` field to `Listing` and gate notifications on it. Needs per-source markup inspection (Centris, DuProprio, ProprioDirect). Low volume but high annoyance — a push about a dead deal erodes trust in the pipe.
+
+### HTTP-layer retry/backoff for transient timeouts *(filed 2026-08-15)*
+
+The first nightly (2026-08-15) died mid-crawl on a single `ReadTimeout` and skipped ~292 extractions with `Connection error` — an overnight network drop (Mac likely asleep). The crawl per-source guard + extract per-listing guard (commit `0de3237`) contain the blast radius, but each transient network blip still loses that unit of work for the night. A small retry-with-backoff wrapper in the shared httpx client (crawlers + `llm_extract`) would ride out brief drops. Deferred: touches every source module for marginal gain on a personal tool that self-heals on the next nightly, and the launchd job already catches up on wake. Revisit if outages prove frequent.
 
 
 
