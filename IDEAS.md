@@ -31,9 +31,15 @@ Shipped `scripts/nightly.sh` + `scripts/com.qc-screener.nightly.plist.template` 
 
 **Deferred (not blocked by anything, filed as new work):** weekly `rents fetch` and monthly `macro refresh` + `schl refresh` remain manual. Adding a second launchd plist with `Weekday: 0` (Sunday) / `Day: 1` (monthly) would automate them. Left out of the initial cut because they change slowly and a nightly run would waste requests.
 
-### Detect sold / off-market listings *(filed 2026-08-15)*
+### Detect sold / off-market listings *(filed 2026-08-15, investigated 2026-08-16 — mostly already handled)*
 
-Surfaced during notify setup: the sainte-marguerite-du-lac listing was still active + Lépine-passing in the DB but is **sold** in reality. `prune --days 7` only removes listings no longer *seen* in the crawl — a listing that stays published with a "sold/vendu" badge keeps passing and could trigger a notification. Idea: parse a sold/conditional-sale status from each source's detail page and either skip it in `screen()`/`scan()` or add a `status` field to `Listing` and gate notifications on it. Needs per-source markup inspection (Centris, DuProprio, ProprioDirect). Low volume but high annoyance — a push about a dead deal erodes trust in the pipe.
+Filed after a "sold" sainte-marguerite listing pinged the phone. **Investigation showed the common case is already covered** — the filed premise (a sold listing "stays published with a sold badge") was wrong for the actual listing:
+
+- **The real culprit was `centris/18658459`** (not `15343216`, which is a different, active sainte-marguerite-du-lac listing that got conflated). Its DB row: `is_active=0`, `last_seen_at=None` — i.e. **already pruned**.
+- **A sold Centris listing delists**: it drops out of search → crawl stops seeing it → `prune --days 7` marks `is_active=0`. Its detail page 302-redirects to `…?listingnotfound=<id>` showing "Cette propriété n'est plus disponible."
+- **The nightly ordering already protects notify**: steps run crawl → prune → extract → notify, and `notify --scan` only scans `is_active=1`. So a sold/delisted listing is deactivated *before* notify runs. The ping the user saw was a **one-time backlog artifact** — 18658459 was pre-automation backlog, notified by a manual `notify --scan --limit 1` test *before* the first crawl/prune cycle removed it. It won't recur in steady state.
+
+**Residual gap (small, deferred):** a listing *sold-but-still-listed* (conditional sale / accepted offer still shown in search). Centris renders that status **badge client-side via JS** (`badge-sold`/`badge-under-agreement` exist only in CSS; the server-rendered `badges-container` carries just a `d-none` hidden badge; no search fragment or detail page has a live badge). Detecting it would need reverse-engineering Centris's status XHR endpoint — brittle, high-effort, rare payoff. If it ever proves a real annoyance, the cheap fix is a manual `mark-sold <id>` CLI flag (sets `is_active=0`) rather than scraping infrastructure. DuProprio already filters sold at search (`-vendu-` URL skip, `duproprio.py:74`).
 
 ### HTTP-layer retry/backoff for transient timeouts *(filed 2026-08-15)*
 
