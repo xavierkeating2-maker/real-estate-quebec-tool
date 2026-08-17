@@ -8,56 +8,13 @@ Each entry: a *filed date* (when the idea came up) and, if pursued, a *done date
 
 ## 🔲 To do
 
-
-### Automate new data fetches and notify for Lépiner passers *(filed 2026-07-02, done 2026-07-31)*
-
-All 6 steps shipped: schema (is_active/last_seen_at/notified_at/last_price_notified + price_history table), `crawl --full`, `prune`, price-history/drop-detection, `notify --scan` (ntfy.sh push for NEW passers + DROP events), and launchd nightly wiring. See individual entries for details on each step.
-
-### Step 6 — launchd nightly wiring *(filed 2026-07-31, code done 2026-07-31, setup in-progress 2026-08-14)*
-
-Shipped `scripts/nightly.sh` + `scripts/com.qc-screener.nightly.plist.template` + `scripts/install-launchd.sh` + `scripts/uninstall-launchd.sh` + RUNBOOK §11. Nightly at 03:00 runs `crawl --full && prune --days 7 && extract --all && notify --scan`, continuing past step failures so a broken crawl doesn't silence the notify. Secrets sourced from `~/.qc-screener.env` (installer refuses if missing). Logs to `data/logs/nightly-YYYY-MM-DD.log` with 30-day rotation. Failure notification pushed via ntfy.sh (high priority) using the existing `NTFY_TOPIC`. Missed runs (Mac asleep at 03:00) catch up on next wake — safe because every step is idempotent.
-
-**Setup checklist — resume here (state as of 2026-08-15):**
-- [x] **A. Pick + subscribe to ntfy topic** — DONE. Old compromised slug replaced with a fresh `openssl rand -hex 8` value `qc-screener-c884763f6e3cd6c6`; user re-subscribed on the ntfy phone app.
-- [x] **B. Save secrets to `~/.qc-screener.env`** — topic written + `chmod 600`. ⚠️ **`ANTHROPIC_API_KEY` still missing** — user has no key yet; must create one at console.anthropic.com (API billing is separate from the Claude Code subscription). Needed only by the `extract` step, so notifications work without it, but the nightly's extract will fail until it's added.
-- [x] **C. Test-send one real notification** — DONE, user confirmed both pings landed on the phone. **Uncovered + fixed a bug:** `notify.send()` put the title/tags in HTTP headers, which are latin-1-only, so any accent (Lépine, éval) or emoji (✅⚠️📉) raised `'ascii' codec can't encode`. Rewrote `send()` to use ntfy's JSON publishing API (UTF-8 native); priority now mapped string→int via `_PRIORITY_TO_INT`. One backlog listing was consumed by this test (marked notified).
-- [x] **D. Absorb the backlog silently.** DONE — `notify --mark-only` marked the remaining 54 active Lépine passers as notified without sending. Future nightly runs now only fire on genuinely new listings + price drops.
-- [x] **E. Install the launchd agent.** DONE — `com.qc-screener.nightly` loaded (verified via `launchctl print`: correct program, working dir, log paths; scheduled 03:00). API key confirmed valid + billing active (HTTP 200 on a minimal messages call) before install. **Fixed a real installer bug found on this first-ever run:** the registration self-check piped `launchctl list` into `grep -q`, whose early-exit gave `launchctl` a SIGPIPE (exit 141), and `set -o pipefail` turned a *successful* match into a FATAL. Now queries the label directly (`launchctl list "$LABEL"`) — no pipe.
-- [~] **F. Test-fire the nightly manually** — FIRED 2026-08-15 18:28. Ran end-to-end and **surfaced 2 real bugs, both now fixed + committed** (`0de3237`):
-  - **extract crashed the whole batch on `float(None)`** — LLM returned `[1535, None]` for `per_unit_rents`; `apply_to_listing` was outside the loop's try/except so one bad listing aborted the run. Fixed (drop None + widen try). Validated on the exact cached crashing input → `[1535.0]`, no crash.
-  - **crawl aborted all sources on one `ReadTimeout`.** Fixed (per-source try/except, still exits non-zero on partial failure).
-  - Also observed: ~292 `Connection error` skips during extract = **overnight network outage (Mac likely asleep)**, not a code bug — the loop correctly skipped them. Notify worked perfectly: 4 real notifications delivered (1 drop + 3 new passers, accents/emoji intact) — the real-path proof of the ntfy JSON fix.
-  - **Remaining:** ~1147 listings still unextracted (the outage + the crash left the batch undrained). Fix is committed, so tonight's 03:00 run will drain them without crashing (network permitting). Final F sign-off = first clean scheduled run — check `nightly-2026-08-17.log`.
-
-**Deferred (not blocked by anything, filed as new work):** weekly `rents fetch` and monthly `macro refresh` + `schl refresh` remain manual. Adding a second launchd plist with `Weekday: 0` (Sunday) / `Day: 1` (monthly) would automate them. Left out of the initial cut because they change slowly and a nightly run would waste requests.
-
-### Detect sold / off-market listings *(filed 2026-08-15, investigated 2026-08-16 — mostly already handled)*
-
-Filed after a "sold" sainte-marguerite listing pinged the phone. **Investigation showed the common case is already covered** — the filed premise (a sold listing "stays published with a sold badge") was wrong for the actual listing:
-
-- **The real culprit was `centris/18658459`** (not `15343216`, which is a different, active sainte-marguerite-du-lac listing that got conflated). Its DB row: `is_active=0`, `last_seen_at=None` — i.e. **already pruned**.
-- **A sold Centris listing delists**: it drops out of search → crawl stops seeing it → `prune --days 7` marks `is_active=0`. Its detail page 302-redirects to `…?listingnotfound=<id>` showing "Cette propriété n'est plus disponible."
-- **The nightly ordering already protects notify**: steps run crawl → prune → extract → notify, and `notify --scan` only scans `is_active=1`. So a sold/delisted listing is deactivated *before* notify runs. The ping the user saw was a **one-time backlog artifact** — 18658459 was pre-automation backlog, notified by a manual `notify --scan --limit 1` test *before* the first crawl/prune cycle removed it. It won't recur in steady state.
-
-**Residual gap (small, deferred):** a listing *sold-but-still-listed* (conditional sale / accepted offer still shown in search). Centris renders that status **badge client-side via JS** (`badge-sold`/`badge-under-agreement` exist only in CSS; the server-rendered `badges-container` carries just a `d-none` hidden badge; no search fragment or detail page has a live badge). Detecting it would need reverse-engineering Centris's status XHR endpoint — brittle, high-effort, rare payoff. If it ever proves a real annoyance, the cheap fix is a manual `mark-sold <id>` CLI flag (sets `is_active=0`) rather than scraping infrastructure. DuProprio already filters sold at search (`-vendu-` URL skip, `duproprio.py:74`).
-
 ### HTTP-layer retry/backoff for transient timeouts *(filed 2026-08-15)*
 
 The first nightly (2026-08-15) died mid-crawl on a single `ReadTimeout` and skipped ~292 extractions with `Connection error` — an overnight network drop (Mac likely asleep). The crawl per-source guard + extract per-listing guard (commit `0de3237`) contain the blast radius, but each transient network blip still loses that unit of work for the night. A small retry-with-backoff wrapper in the shared httpx client (crawlers + `llm_extract`) would ride out brief drops. Deferred: touches every source module for marginal gain on a personal tool that self-heals on the next nightly, and the launchd job already catches up on wake. Revisit if outages prove frequent.
 
+### Automate the weekly/monthly refreshes *(filed 2026-07-31)*
 
-
-### ntfy.sh push notifications *(filed 2026-07-02, done 2026-07-31)*
-
-New `qc_screener/notify.py` module + `NotifyConfig` in `config.py` + `notify` CLI command. Reads topic from `NTFY_TOPIC` env var (private-by-obscurity — ntfy.sh topics are public). Two event kinds: NEW (`notified_at IS NULL` + passes Lépine) and DROP (asking_price < last_price_notified × (1 - threshold)). Priority auto-elevated to `high` when drop ≥ 5 %. Backlog absorption via `--mark-only` flag (marks candidates as notified without sending). Safety features: `--dry-run`, `--limit N`, warning + 3s pause when about to send > 20 notifications. Gates persist in `listings.notified_at` and `listings.last_price_notified` so soft-delete + resurrection doesn't re-notify. Uses httpx.Client with 0.2 s throttle between sends (well under ntfy.sh's 5 msg/sec limit).
-
-### Price history + drop detection *(filed 2026-07-02, done 2026-07-31)*
-
-New `price_history` table (source, source_id, seen_at, asking_price). Auto-populated by `storage.upsert_listing` on every crawl — only inserts when the incoming price differs from the last observation. One-shot seed on migration inserts current price of every existing listing with `seen_at = fetched_at`, so the 4,555 pre-existing priced listings have an immediate baseline. New CLI: `qc-screener price-history <source_id>` (timeline table) and `qc-screener price-drops --days N --min-drop-pct X` (recent drops ranked by biggest %). Streamlit: `Δ prix 30j` column in Annonces tab + mini line chart in Analyseur when ≥2 observations. The `recent_price_drops` SQL uses LAG() window functions to compare each observation vs its predecessor efficiently.
-
-### Automate deletion of sold or no-longer-available listings *(filed 2026-07-02, partial 2026-07-30)*
-
-Storage layer + pruner shipped. `listings` gained `is_active` + `last_seen_at`; `crawl` (esp. `--full`) stamps `last_seen_at` on every seen listing; new `qc-screener prune --days 7` soft-deletes actives whose `last_seen_at` is stale, with two safeguards (refuses if >50 % of actives have NULL `last_seen_at`, or if the most recent crawl itself is older than the window). CLI screener (`run`, `value`) excludes pruned rows by default (`--include-inactive` to include); Streamlit hides them by default (sidebar toggle). Resurrection is automatic — a listing reappearing in a later `crawl --full` flips back to `is_active = 1`. Still to do: launchd nightly wiring (Step 6) so this runs untouched.
+The nightly automates the daily pipeline (crawl → prune → extract → notify), but weekly `rents fetch` and monthly `macro refresh` + `schl refresh` remain manual. A second launchd plist with `Weekday: 0` (Sunday) / `Day: 1` (monthly) would automate them. Left out of the nightly cut because they change slowly and running them nightly would waste requests.
 
 ### Personal Tax Considerations (ex. mortgage payment deductions)
 
@@ -65,7 +22,7 @@ Storage layer + pruner shipped. `listings` gained `is_active` + `last_seen_at`; 
 ### High-value data we already have but haven't parsed
 
 - **Per-unit rents from listing prose** *(filed 2026-06-21, partial 2026-06-22)*
-  We now capture the full description text — so the data is ready. A regex pass across 100 cached DuProprio listings showed only ~3% yield (most sellers write annual totals, not per-unit). Real extraction needs an LLM (filed separately) or domain-tuned prompts; the regex-only approach isn't worth the maintenance burden. Description is in the model + Streamlit so the user can read it directly.
+  We now capture the full description text — so the data is ready. A regex pass across 100 cached DuProprio listings showed only ~3% yield (most sellers write annual totals, not per-unit). Real extraction needs an LLM (shipped — see Done 2026-06-22) or domain-tuned prompts; the regex-only approach isn't worth the maintenance burden. Description is in the model + Streamlit so the user can read it directly.
 
 ### Polish on existing tools
 
@@ -83,14 +40,11 @@ Storage layer + pruner shipped. `listings` gained `is_active` + `last_seen_at`; 
 - **Scrape declared `annual_expenses` from listings** *(filed 2026-07-02)*
   Prerequisite for empirical expense-ratio cohorts. Currently 0/861 listings have `annual_expenses` populated (only revenues + taxes). Centris + PD typically list "Dépenses totales" or "Dépenses annuelles" in the financial detail table; DuProprio less consistent. Once 100+ listings have it, `analyzer.estimate_expense_ratio` can add an empirical branch (median declared_expenses / declared_revenue by units×region cohort) with fallback to the current Lépine tiered defaults.
 
-
 - **StatCan / Teranet HPI for cleaner appreciation** *(filed 2026-07-02)*
   Current Registre foncier appreciation uses weighted band-midpoints (±1pp noise from the >500K band being unbounded). A cleaner alternative: pull the New Housing Price Index (StatCan Table 18-10-0205) or Teranet-NBC HPI by CMA. Would give a proper monthly HPI YoY per CMA. Adds ~1h of work for meaningfully lower noise. Only worth doing if the current signal proves too jumpy in practice.
 
 - **General assistant — the third tool** *(filed 2026-06-18)*
   Q&A surface that knows Lépine's method and the user's deal context. Useful once enough structured data flows through the screener and analyzer to ground answers.
-
-- **LLM extraction of revenue from listing prose** *(filed 2026-06-18, done 2026-06-22)* — moved to Done
 
 - **Densification / zoning-arbitrage angle** *(filed 2026-06-18)*
   Scan municipal urbanism documents to identify properties where zoning changes could unlock value. Off-target for vanilla Lépine but a genuinely different alpha source. Stack reference: `rhanka/radar-immobilier`.
@@ -98,6 +52,22 @@ Storage layer + pruner shipped. `listings` gained `is_active` + `last_seen_at`; 
 ---
 
 ## ✅ Done
+
+### 2026-08-16
+
+- **Automation initiative — nightly refresh + push notifications (went live)** *(filed 2026-07-02, code shipped 2026-07-31, live 2026-08-16)*
+  All 6 steps of the automation initiative shipped and the nightly is now installed and running. Steps: schema (`is_active`/`last_seen_at`/`notified_at`/`last_price_notified` + `price_history` table), `crawl --full`, `prune`, price-history/drop-detection, `notify --scan` (ntfy.sh push for NEW passers + DROP events), and launchd nightly wiring (`scripts/nightly.sh` + `com.qc-screener.nightly.plist.template` + `install-launchd.sh` + `uninstall-launchd.sh` + RUNBOOK §11). Nightly at 03:00 runs `crawl --full && prune --days 7 && extract --all && notify --scan`, continuing past step failures so a broken crawl doesn't silence the notify. Secrets sourced from `~/.qc-screener.env`; logs to `data/logs/nightly-YYYY-MM-DD.log` (30-day rotation); failure alert pushed via ntfy.sh (high priority). Missed runs (Mac asleep) catch up on next wake — every step is idempotent.
+  **Go-live setup (2026-08-16):** private ntfy topic generated (`openssl rand -hex 8`) + subscribed on phone; `~/.qc-screener.env` written (`chmod 600`) with topic + `ANTHROPIC_API_KEY` (verified valid + billing active via a minimal messages call); backlog absorbed with `notify --mark-only` (54 listings) so only genuinely-new listings/drops fire; launchd agent loaded + verified (`launchctl print`, scheduled 03:00). The first test-fire ran end-to-end and surfaced **4 bugs, all fixed + pushed**: (1) `17745a4` ntfy crash on accented/emoji titles — HTTP headers are latin-1 only → switched to ntfy's UTF-8 JSON API; (2) `a92ed9b` launchd installer false-FATAL — `launchctl list | grep -q` gave launchctl a SIGPIPE (141) that `pipefail` turned into failure → query the label directly; (3+4) `0de3237` extract aborting the whole batch on `float(None)` (apply/persist were outside the loop's try) and crawl aborting all sources on one `ReadTimeout` → per-listing and per-source guards. Real-path proof: the run delivered 4 correct notifications (1 drop + 3 new passers, accents/emoji intact). Final sign-off = first fully clean scheduled run (watch `nightly-2026-08-17.log`).
+
+- **Automate deletion of sold / no-longer-available listings (now fully automated)** *(filed 2026-07-02, storage+pruner 2026-07-30, automated 2026-08-16)*
+  Storage layer + pruner shipped. `listings` gained `is_active` + `last_seen_at`; `crawl` (esp. `--full`) stamps `last_seen_at` on every seen listing; `qc-screener prune --days 7` soft-deletes actives whose `last_seen_at` is stale, with two safeguards (refuses if >50 % of actives have NULL `last_seen_at`, or if the most recent crawl itself is older than the window). CLI screener (`run`, `value`) excludes pruned rows by default (`--include-inactive` to include); Streamlit hides them by default (sidebar toggle). Resurrection is automatic — a listing reappearing in a later `crawl --full` flips back to `is_active = 1`. **Now runs untouched** via the launchd nightly (Step 6, above).
+
+- **Detect sold / off-market listings — investigated, common case already handled** *(filed 2026-08-15, closed 2026-08-16)*
+  Filed after a "sold" sainte-marguerite listing pinged the phone. Investigation showed the filed premise (a sold listing "stays published with a sold badge") was wrong for the actual listing, and the common case is already covered:
+  - **The real culprit was `centris/18658459`** (not `15343216`, a different, active sainte-marguerite-du-lac listing that got conflated). Its DB row: `is_active=0`, `last_seen_at=None` — i.e. **already pruned**.
+  - **A sold Centris listing delists**: it drops out of search → crawl stops seeing it → `prune --days 7` marks `is_active=0`. Its detail page 302-redirects to `…?listingnotfound=<id>` showing "Cette propriété n'est plus disponible."
+  - **The nightly ordering already protects notify**: crawl → prune → extract → notify, and `notify --scan` only scans `is_active=1`, so a sold/delisted listing is deactivated *before* notify runs. The observed ping was a **one-time backlog artifact** — 18658459 was pre-automation backlog, notified by a manual `notify --scan --limit 1` test *before* the first crawl/prune cycle removed it. Won't recur in steady state.
+  - **Residual gap (small, deferred):** a listing *sold-but-still-listed* (conditional sale / accepted offer still shown). Centris renders that badge client-side via JS (`badge-sold`/`badge-under-agreement` exist only in CSS; the server-rendered `badges-container` carries just a `d-none` hidden badge). Detecting it would need reverse-engineering Centris's status XHR — brittle, rare payoff. Cheap fallback if it ever matters: a manual `mark-sold <id>` CLI flag setting `is_active=0`. DuProprio already filters sold at search (`-vendu-` URL skip, `duproprio.py:74`).
 
 ### 2026-07-02
 
