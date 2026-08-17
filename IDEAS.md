@@ -8,9 +8,11 @@ Each entry: a *filed date* (when the idea came up) and, if pursued, a *done date
 
 ## 🔲 To do
 
-### HTTP-layer retry/backoff for transient timeouts *(filed 2026-08-15)*
+### HTTP-layer retry/backoff for transient timeouts *(filed 2026-08-15, Centris done 2026-08-17)*
 
-The first nightly (2026-08-15) died mid-crawl on a single `ReadTimeout` and skipped ~292 extractions with `Connection error` — an overnight network drop (Mac likely asleep). The crawl per-source guard + extract per-listing guard (commit `0de3237`) contain the blast radius, but each transient network blip still loses that unit of work for the night. A small retry-with-backoff wrapper in the shared httpx client (crawlers + `llm_extract`) would ride out brief drops. Deferred: touches every source module for marginal gain on a personal tool that self-heals on the next nightly, and the launchd job already catches up on wake. Revisit if outages prove frequent.
+Transient network drops kept losing work: the 2026-08-15 nightly died mid-crawl on a `ReadTimeout` and skipped ~292 extractions with `Connection error` (Mac asleep); the 2026-08-17 nightly aborted the whole Centris walk on "Server disconnected without sending a response". **Centris retry shipped** (commit `36e3d74`): `_send_with_retry()` wraps both Centris fetches (3 attempts, 2s/4s backoff, transient httpx errors only). Validated on the 2026-08-17 full backfill — 3 `RemoteProtocolError` drops, all recovered, crawl completed (4,005 active).
+
+**Still deferred (no evidence they need it):** DuProprio, ProprioDirect, and `llm_extract` have no retry. They've crawled/extracted cleanly every night — the per-source and per-listing guards already contain their blips, and the launchd job catches up on wake. Add retry there only if one starts failing repeatedly.
 
 ### Automate the weekly/monthly refreshes *(filed 2026-07-31)*
 
