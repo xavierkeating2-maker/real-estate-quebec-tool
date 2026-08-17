@@ -19,15 +19,10 @@ The nightly automates the daily pipeline (crawl → prune → extract → notify
 ### Personal Tax Considerations (ex. mortgage payment deductions)
 
 
-### High-value data we already have but haven't parsed
-
-- **Per-unit rents from listing prose** *(filed 2026-06-21, partial 2026-06-22)*
-  We now capture the full description text — so the data is ready. A regex pass across 100 cached DuProprio listings showed only ~3% yield (most sellers write annual totals, not per-unit). Real extraction needs an LLM (shipped — see Done 2026-06-22) or domain-tuned prompts; the regex-only approach isn't worth the maintenance burden. Description is in the model + Streamlit so the user can read it directly.
-
 ### Polish on existing tools
 
 - **Rent-comp coverage for small cities** *(filed 2026-06-19)*
-  Trois-Rivières (n=1), Lévis (n=5), Drummondville (n=0): the 250-listing LogisQuébec sample spreads too thin across 8K apartments. Options: (a) raise crawl to 1000+ listings (~50 min); (b) targeted crawl by region — walk `/a-louer/<region>` or filter sitemap URLs by city slug; (c) cross-city interpolation (nearest metro's cohort as fallback). Option (b) is probably cleanest.
+  Still thin as of 2026-08-16 — 82 of 93 cities have <5 comps: Trois-Rivières (n=3), Lévis (n=8), Drummondville (n=1). The 882-comp sample spreads too thin across 8K apartments. Options: (a) raise crawl to 1000+ listings (~50 min); (b) targeted crawl by region — walk `/a-louer/<region>` or filter sitemap URLs by city slug; (c) cross-city interpolation (nearest metro's cohort as fallback). Option (b) is probably cleanest.
 
 - **Deal-analyzer — TAL/régie constraints** *(filed 2026-06-21)*
   Quebec's Tribunal administratif du logement caps rent increases at ~2-4%/year and renters have strong tenure; the rent-reset thesis can only realize as units turn over. Add a `--rent-reset-years` flag (default 1 = immediate, 5 = phased over turnover horizon) that ramps stabilized revenue linearly from listing-reported to target. Refines PAT 1128857-style cases.
@@ -35,7 +30,7 @@ The nightly automates the daily pipeline (crawl → prune → extract → notify
 ### New tools / sources
 
 - **Scrape declared `annual_expenses` from listings** *(filed 2026-07-02)*
-  Prerequisite for empirical expense-ratio cohorts. Currently 0/861 listings have `annual_expenses` populated (only revenues + taxes). Centris + PD typically list "Dépenses totales" or "Dépenses annuelles" in the financial detail table; DuProprio less consistent. Once 100+ listings have it, `analyzer.estimate_expense_ratio` can add an empirical branch (median declared_expenses / declared_revenue by units×region cohort) with fallback to the current Lépine tiered defaults.
+  Prerequisite for empirical expense-ratio cohorts. Still 0/5173 listings have `annual_expenses` populated as of 2026-08-16 (only revenues + taxes). Centris + PD typically list "Dépenses totales" or "Dépenses annuelles" in the financial detail table; DuProprio less consistent. Once 100+ listings have it, `analyzer.estimate_expense_ratio` can add an empirical branch (median declared_expenses / declared_revenue by units×region cohort) with fallback to the current Lépine tiered defaults.
 
 - **StatCan / Teranet HPI for cleaner appreciation** *(filed 2026-07-02)*
   Current Registre foncier appreciation uses weighted band-midpoints (±1pp noise from the >500K band being unbounded). A cleaner alternative: pull the New Housing Price Index (StatCan Table 18-10-0205) or Teranet-NBC HPI by CMA. Would give a proper monthly HPI YoY per CMA. Adds ~1h of work for meaningfully lower noise. Only worth doing if the current signal proves too jumpy in practice.
