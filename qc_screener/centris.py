@@ -30,6 +30,21 @@ USER_AGENT = (
     "AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36"
 )
 THROTTLE_SECONDS = 4.0
+# Centris drops connections intermittently mid-crawl (observed 2 nights running:
+# ReadTimeout, then "Server disconnected without sending a response"). A single
+# drop on a search-page fetch used to abort the entire Centris walk. Retry
+# transient network errors with exponential backoff before giving up.
+MAX_RETRIES = 3
+RETRY_BACKOFF_BASE = 2.0  # seconds between attempts: 2, 4 (then raise)
+_TRANSIENT_ERRORS = (
+    httpx.RemoteProtocolError,   # "Server disconnected without sending a response"
+    httpx.ReadTimeout,
+    httpx.ConnectTimeout,
+    httpx.PoolTimeout,
+    httpx.ConnectError,
+    httpx.ReadError,
+    httpx.WriteError,
+)
 CACHE_DIR = Path("data/cache/centris")
 BASE = "https://www.centris.ca"
 SEARCH_URL = f"{BASE}/fr/plex~a-vendre"
@@ -76,6 +91,28 @@ def _client() -> httpx.Client:
     )
 
 
+def _send_with_retry(send, *, what: str):
+    """Execute an httpx request `send()`, retrying transient network drops.
+
+    Returns the response on success; re-raises the last transient error after
+    MAX_RETRIES. Non-transient errors propagate immediately.
+    """
+    last: Exception | None = None
+    for attempt in range(1, MAX_RETRIES + 1):
+        try:
+            return send()
+        except _TRANSIENT_ERRORS as e:
+            last = e
+            if attempt == MAX_RETRIES:
+                break
+            wait = RETRY_BACKOFF_BASE * (2 ** (attempt - 1))
+            print(f"[centris] {what}: {type(e).__name__} "
+                  f"(tentative {attempt}/{MAX_RETRIES}) — retry dans {wait:.0f}s")
+            time.sleep(wait)
+    assert last is not None
+    raise last
+
+
 def _cache_path(url: str) -> Path:
     h = hashlib.sha1(url.encode()).hexdigest()[:16]
     return CACHE_DIR / f"{h}.html"
@@ -89,7 +126,7 @@ def _fetch_html(client: httpx.Client, url: str, *, use_cache: bool = True,
         return cached.read_text(encoding="utf-8")
     if throttle:
         time.sleep(THROTTLE_SECONDS)
-    r = client.get(url)
+    r = _send_with_retry(lambda: client.get(url), what=f"GET {url}")
     r.raise_for_status()
     cached.write_text(r.text, encoding="utf-8")
     return r.text
@@ -126,7 +163,10 @@ def _fetch_search_page(client: httpx.Client, page: int, sort_seed: int) -> str:
         "X-Requested-With": "XMLHttpRequest",
         "Referer": SEARCH_URL,
     }
-    r = client.post(INSCRIPTIONS_API, json=payload, headers=headers)
+    r = _send_with_retry(
+        lambda: client.post(INSCRIPTIONS_API, json=payload, headers=headers),
+        what=f"page {page}",
+    )
     r.raise_for_status()
     data = r.json()
     if not data.get("d", {}).get("Succeeded"):
