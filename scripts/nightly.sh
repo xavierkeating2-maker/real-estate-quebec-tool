@@ -8,6 +8,18 @@
 
 set -uo pipefail
 
+# Keep the Mac awake for the whole run so idle sleep can't freeze the crawl
+# mid-flight. A frozen crawl drops its network connections and, on wake, throws
+# RemoteProtocolError/ReadTimeout — which is how a ~90-min run got smeared across
+# ~15h of hourly DarkWakes on 2026-08-19. Re-exec once under caffeinate.
+# NOTE: caffeinate blocks *idle* sleep only. Closing the lid still sleeps unless
+# the Mac is in clamshell mode (external display + power). For a reliable 03:00
+# run: leave it plugged in with the lid open.
+if [ -z "${QCS_CAFFEINATED:-}" ] && command -v caffeinate >/dev/null 2>&1; then
+    export QCS_CAFFEINATED=1
+    exec caffeinate -i "$0" "$@"
+fi
+
 PROJECT_DIR="$(cd "$(dirname "$0")/.." && pwd)"
 cd "$PROJECT_DIR"
 
