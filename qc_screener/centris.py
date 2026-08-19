@@ -45,6 +45,12 @@ _TRANSIENT_ERRORS = (
     httpx.ReadError,
     httpx.WriteError,
 )
+# Borne du temps de marche Centris. Quand Centris est degrade/limite (reponses
+# proches du timeout de 30s), un walk complet peut trainer sur des heures et
+# empieter sur le run suivant. Au-dela de ce budget on arrete de paginer et on
+# finit le pipeline avec ce qui est deja crawle; le prochain run rattrape le reste.
+CENTRIS_TIME_BUDGET_S = 90 * 60  # 90 min
+
 CACHE_DIR = Path("data/cache/centris")
 BASE = "https://www.centris.ca"
 SEARCH_URL = f"{BASE}/fr/plex~a-vendre"
@@ -356,11 +362,30 @@ def parse_detail(url: str, page_html: str) -> Listing:
     )
 
 
-def crawl_listings(max_pages: int = 5, region: str | None = None) -> Iterator[Listing]:
-    """Iter les Listing Centris. `region` non utilise (filtre fait coté query si on veut)."""
+def crawl_listings(
+    max_pages: int = 5,
+    region: str | None = None,
+    time_budget_s: float | None = CENTRIS_TIME_BUDGET_S,
+) -> Iterator[Listing]:
+    """Iter les Listing Centris. `region` non utilise (filtre fait coté query si on veut).
+
+    `time_budget_s` borne la duree totale du walk: au-dela, on cesse de paginer
+    et on rend le partiel (0 ou None = pas de borne). Verifie avant chaque page
+    ET avant chaque fiche, donc le depassement max = la duree d'une seule fiche.
+    """
+    start = time.monotonic()
+
+    def _over_budget() -> bool:
+        return bool(time_budget_s) and (time.monotonic() - start) > time_budget_s
+
     with _client() as c:
         sort_seed, total = _prime_session(c)
         for page in range(1, max_pages + 1):
+            if _over_budget():
+                mins = time_budget_s / 60
+                print(f"[centris] budget temps ({mins:.0f}min) depasse a la page "
+                      f"{page} — arret de la pagination (crawl partiel).")
+                return
             fragment = _fetch_search_page(c, page, sort_seed)
             if not fragment:
                 break
@@ -368,6 +393,11 @@ def crawl_listings(max_pages: int = 5, region: str | None = None) -> Iterator[Li
             if not urls:
                 break
             for path in urls:
+                if _over_budget():
+                    mins = time_budget_s / 60
+                    print(f"[centris] budget temps ({mins:.0f}min) depasse en page "
+                          f"{page} — arret (crawl partiel).")
+                    return
                 full = BASE + path
                 try:
                     html_text = _fetch_html(c, full)
