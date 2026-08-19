@@ -46,8 +46,10 @@ class LocationFilter:
     # Centroide Grand Montreal — remplacer par votre adresse precise si voulu.
     home_lat: float = 45.5019
     home_lon: float = -73.5674
-    # Rayon a vol d'oiseau (km). 175 inclut Gatineau (166 km).
-    max_km: float = 175.0
+    # Rayon a vol d'oiseau (km). 100 km ≈ 1.5 h de route; au-dela les annonces
+    # sont trop loin pour gerer en personne (175 incluait Gatineau/Sherbrooke a
+    # 2 h+). Ajuster via --max-km ou le slider Streamlit au besoin.
+    max_km: float = 100.0
 
 
 @dataclass(frozen=True)

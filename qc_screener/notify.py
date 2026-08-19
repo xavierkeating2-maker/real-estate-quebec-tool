@@ -11,6 +11,7 @@ Un `crawl --full` ulterieur qui la ressuscite ne re-notifie pas.
 """
 from __future__ import annotations
 
+import re
 import sqlite3
 import time
 from dataclasses import dataclass
@@ -25,6 +26,19 @@ from .lepine import screen
 from .models import Listing
 
 NotificationKind = Literal["new", "drop"]
+
+# propriodirect syndique ses annonces vers Centris sous le MEME identifiant
+# numerique. Deux lignes (source, source_id) distinctes decrivent alors le meme
+# immeuble physique. On les dedoublonne au moment de notifier via une cle
+# (source_id, ville normalisee) — la ville sert de garde-fou contre une
+# hypothetique collision d'ID entre deux annonces non liees. Quand plusieurs
+# jumeaux sont candidats, on prefere Centris (donnees plus completes).
+_SOURCE_PRIORITY = {"centris": 0}
+
+
+def _phys_key(source_id: str, city: str | None) -> tuple[str, str]:
+    """Cle d'identite physique pour collapser les cross-postings pd/centris."""
+    return (source_id, re.sub(r"[^0-9a-z]", "", (city or "").lower()))
 
 
 @dataclass
@@ -125,14 +139,31 @@ def scan(
         "FROM listings WHERE is_active = 1"
     ).fetchall()
 
-    notifications: list[Notification] = []
-    passing_statuses = {"pass", "pass_partial"} if include_partial else {"pass"}
-
+    parsed = []
     for source, source_id, payload, notified_at, last_price_notified in rows:
         try:
             listing = Listing.model_validate_json(payload)
         except Exception:
             continue
+        parsed.append((listing, source_id, notified_at, last_price_notified))
+
+    # On prefere Centris quand deux jumeaux sont tous deux candidats: en le
+    # placant en tete, c'est lui qui remplit `seen_keys` en premier.
+    parsed.sort(key=lambda p: _SOURCE_PRIORITY.get(p[0].source, 1))
+
+    # Cles d'immeubles deja notifiees sous n'importe quelle source: un jumeau
+    # cross-poste (pd/centris partagent source_id) ne doit pas re-alerter.
+    notified_keys = {
+        _phys_key(sid, listing.city)
+        for (listing, sid, notified_at, _) in parsed
+        if notified_at is not None
+    }
+
+    notifications: list[Notification] = []
+    seen_keys: set[tuple[str, str]] = set()
+    passing_statuses = {"pass", "pass_partial"} if include_partial else {"pass"}
+
+    for listing, source_id, notified_at, last_price_notified in parsed:
         # Filtre distance (meme convention que run/value).
         if max_km > 0:
             if listing.lat is None or listing.lon is None:
@@ -144,8 +175,14 @@ def scan(
         if verdict.status not in passing_statuses:
             continue
 
+        key = _phys_key(source_id, listing.city)
+
         if notified_at is None:
-            # NEW — jamais notifiee.
+            # NEW — jamais notifiee. On saute si un jumeau a deja ete notifie
+            # (autre source) ou deja emis dans ce meme scan.
+            if key in notified_keys or key in seen_keys:
+                continue
+            seen_keys.add(key)
             notifications.append(_format_new(listing, verdict))
         elif (
             last_price_notified is not None
@@ -154,6 +191,10 @@ def scan(
         ):
             drop_pct = (last_price_notified - listing.asking_price) / last_price_notified * 100
             if drop_pct >= notify_cfg.drop_threshold_pct:
+                # Un jumeau peut aussi baisser: ne pas dupliquer le drop.
+                if key in seen_keys:
+                    continue
+                seen_keys.add(key)
                 notifications.append(_format_drop(
                     listing, verdict, last_price_notified, listing.asking_price,
                 ))
@@ -189,12 +230,16 @@ def send(
 
 
 def mark_notified(conn: sqlite3.Connection, notif: Notification) -> None:
-    """Persiste la notification comme envoyee — apres send() reussi."""
+    """Persiste la notification comme envoyee — apres send() reussi.
+
+    Marque aussi tout jumeau cross-poste (meme `source_id`, autre source — le
+    meme immeuble syndique sur l'autre portail) pour qu'il ne re-alerte jamais.
+    """
     now = datetime.now(timezone.utc).isoformat()
     conn.execute(
         "UPDATE listings SET notified_at = ?, last_price_notified = ? "
-        "WHERE source = ? AND source_id = ?",
-        (now, notif.price_to_record, notif.listing.source, notif.listing.source_id),
+        "WHERE source_id = ?",
+        (now, notif.price_to_record, notif.listing.source_id),
     )
     conn.commit()
 
