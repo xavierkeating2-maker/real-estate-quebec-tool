@@ -649,20 +649,55 @@ with tab_analyse:
                 conn, listing_row.get("city"), unit_mix
             )
 
-        col4, col5 = st.columns(2)
-        # Priorite: rents extraits LLM > cohorte marche > revenus annonce
+        # Priorite: rents extraits LLM > cohorte marche > revenus annonce.
         extracted = listing_row.get("extracted_revenue")
-        if extracted and not pd.isna(extracted):
+        has_extracted = bool(extracted and not pd.isna(extracted))
+        listed_rev_val = listing_row.get("annual_gross_revenue")
+        listed_rev_val = (
+            float(listed_rev_val)
+            if (listed_rev_val and not pd.isna(listed_rev_val)) else None
+        )
+        # Option 1 — quand le loyer de marche sous-estime largement les revenus
+        # annonces (immeuble mixte commercial/residentiel dont l'unite commerciale
+        # n'est pas comptee dans `units`, ou logements sous-loues vs marche),
+        # l'auto-remplissage marche fausse le cashflow (peut le rendre tres
+        # negatif). On prefere alors les revenus annonces comme defaut — pour
+        # concorder avec l'onglet Aubaines — et on avertit de l'ecart.
+        MARKET_UNDERCOUNT_FACTOR = 1.5
+        market_undercounts = bool(
+            not has_extracted and use_market and market_rev and listed_rev_val
+            and listed_rev_val >= MARKET_UNDERCOUNT_FACTOR * market_rev
+        )
+        if market_undercounts:
+            st.warning(
+                f"⚠️ **Revenus annoncés {fmt_money(listed_rev_val)}/an ≈ "
+                f"{listed_rev_val / market_rev:.1f}× le loyer de marché des {units} "
+                f"logement(s) résidentiel(s) ({fmt_money(market_rev)}/an).** "
+                "Cause probable : unité commerciale / usage mixte non comptée dans "
+                "« logements », ou logements sous-loués vs marché. Le défaut est réglé "
+                "sur les **revenus annoncés** pour concorder avec l'onglet Aubaines — "
+                "décoche « Auto-remplir avec loyers du marché » ou ajuste le champ "
+                "ci-dessous pour tester un autre scénario."
+            )
+
+        col4, col5 = st.columns(2)
+        if has_extracted:
             default_revenue = int(extracted)
             col4.success(
                 f"🤖 Revenus extraits par LLM: **{fmt_money(extracted)}/an** "
                 f"(loyers par logt: {listing_row.get('per_unit_rents')})"
             )
+        elif market_undercounts:
+            default_revenue = int(listed_rev_val)
+            col4.info(
+                f"Revenus annoncés: **{fmt_money(default_revenue)}/an** "
+                f"(marché {canon}: {fmt_money(market_rev)}/an — sous-estimé)"
+            )
         elif use_market and market_rev:
             default_revenue = int(market_rev)
             col4.success(f"Loyer marché ({canon}): **{fmt_money(market_rev)}/an**")
-        elif listing_row.get("annual_gross_revenue"):
-            default_revenue = int(listing_row["annual_gross_revenue"])
+        elif listed_rev_val:
+            default_revenue = int(listed_rev_val)
             col4.info(f"Revenus annoncés: **{fmt_money(default_revenue)}/an**")
         else:
             default_revenue = 0
