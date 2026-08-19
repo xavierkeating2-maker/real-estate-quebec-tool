@@ -25,18 +25,18 @@ After this, all commands below run from `~/projects/real-estate-quebec-tool/` wi
 
 Five independent pipelines feed the tool; each has its own cadence.
 
-| # | Pipeline                | Command (prefix `.venv/bin/qc-screener`)                                    | Cadence                              | Wall-time |
-|---|-------------------------|-----------------------------------------------------------------------------|--------------------------------------|-----------|
-| A | Listings — quick        | `crawl --source all --max-pages 20`                                         | Daily / on demand                    | ~5 min    |
-| A′| Listings — full walk ⭐  | `crawl --source all --full`                                                 | Weekly (or nightly when automated)   | ~20 min   |
-| B | Rent comps — Kijiji     | `rents fetch --source kijiji --max-pages 15 && rents renormalize`           | Bi-weekly                            | ~1 min    |
-| B′| Rent comps — LogisQC    | `rents fetch --source logisquebec --max-listings 250 && rents renormalize`  | Monthly                              | ~12 min   |
-| C | Registre foncier        | `macro refresh`                                                             | Monthly                              | ~30 s     |
-| D | SCHL / StatCan          | `schl refresh`                                                              | Monthly (updates ~yearly, cheap)     | ~30 s     |
+| # | Pipeline                | Command (prefix `.venv/bin/qc-screener`)                                    | Cadence                              | Wall-time        | 
+|---|-------------------------|-----------------------------------------------------------------------------|--------------------------------------|------------------|
+| A | Listings — quick        | `crawl --source all --max-pages 20`                                         | Daily / on demand                    | ~5 min           |
+| A′| Listings — full walk ⭐ | `crawl --source all --full`                                                 | Weekly (or nightly when automated)   | ~20 min          |
+| B | Rent comps — Kijiji     | `rents fetch --source kijiji --max-pages 15 && rents renormalize`           | Bi-weekly                            | ~1 min           |
+| B′| Rent comps — LogisQC    | `rents fetch --source logisquebec --max-listings 250 && rents renormalize`  | Monthly                              | ~12 min          |
+| C | Registre foncier        | `macro refresh`                                                             | Monthly                              | ~30 s            |
+| D | SCHL / StatCan          | `schl refresh`                                                              | Monthly (updates ~yearly, cheap)     | ~30 s            |
 | E | LLM extraction          | `extract --all`  *(requires `ANTHROPIC_API_KEY`)*                           | After every full crawl               | ~$0.10 / 100 new |
-| F | Prune stale listings ⭐  | `prune --days 7`                                                            | After every full crawl               | <1 s      |
-| G | Price history ⭐         | *(auto — populated on every `crawl`)*  · inspect with `price-drops --days 7` | Auto                            | 0 s       |
-| H | Push notifications ⭐    | `notify --scan`  *(requires `NTFY_TOPIC` env var — see §2.1)*               | After every full crawl               | ~15 s     |
+| F | Prune stale listings ⭐ | `prune --days 7`                                                            | After every full crawl               | <1 s             |
+| G | Price history ⭐        | *(auto — populated on every `crawl`)*  · inspect with `price-drops --days 7`| Auto                                 | 0 s              |
+| H | Push notifications ⭐   | `notify --scan`  *(requires `NTFY_TOPIC` env var — see §2.1)*               | After every full crawl               | ~15 s            |
 
 Details for each cadence in §1–§3 below.
 
